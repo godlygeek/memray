@@ -111,8 +111,8 @@ class PythonStackTracker
 
   public:
     void reset(PyFrameObject* current_frame);
-    void emitPendingPops();
-    void emitPendingPushes();
+    void emitPendingPops(Transaction& txn);
+    void emitPendingPushes(Transaction& txn);
     int getCurrentPythonLineNumber();
     void setMostRecentFrameLineNumber(int lineno);
     int pushPythonFrame(PyFrameObject* frame);
@@ -142,7 +142,7 @@ PythonStackTracker::reset(PyFrameObject* current_frame)
 }
 
 inline void
-PythonStackTracker::emitPendingPops()
+PythonStackTracker::emitPendingPops(Transaction& txn)
 {
     if (d_tracker_generation != g_tracker_generation) {
         // The Tracker has changed underneath us (either by an after-fork
@@ -157,13 +157,13 @@ PythonStackTracker::emitPendingPops()
             }
         }
     } else {
-        Tracker::getTracker()->popFrames(d_num_pending_pops);
+        Tracker::getTracker()->popFrames(txn, d_num_pending_pops);
         d_num_pending_pops = 0;
     }
 }
 
 void
-PythonStackTracker::emitPendingPushes()
+PythonStackTracker::emitPendingPushes(Transaction& txn)
 {
     if (!d_stack) {
         return;
@@ -173,7 +173,7 @@ PythonStackTracker::emitPendingPushes()
             std::find_if(d_stack->rbegin(), d_stack->rend(), [](auto& f) { return f.emitted; });
 
     for (auto to_emit = last_emitted_rit.base(); to_emit != d_stack->end(); to_emit++) {
-        if (!Tracker::getTracker()->pushFrame(to_emit->raw_frame_record)) {
+        if (!Tracker::getTracker()->pushFrame(txn, to_emit->raw_frame_record)) {
             break;
         }
         to_emit->emitted = true;
@@ -252,12 +252,6 @@ PythonStackTracker::popPythonFrame()
             assert(d_num_pending_pops != 0);  // Ensure we didn't overflow.
         }
         d_stack->pop_back();
-
-        if (d_stack->empty()) {
-            // Every frame we've pushed has been popped. Emit pending pops now
-            // in case the thread is exiting and we don't get another chance.
-            emitPendingPops();
-        }
     }
 }
 
@@ -381,7 +375,9 @@ Tracker::BackgroundThread::start()
                 Tracker::deactivate();
                 break;
             }
-            if (!d_writer->writeRecord(RecordType::MEMORY_RECORD, MemoryRecord{timeElapsed(), rss})) {
+            Transaction txn = d_writer->startTransaction();
+            txn.writeRecord(RecordType::MEMORY_RECORD, MemoryRecord{timeElapsed(), rss});
+            if (!d_writer->commitTransaction(std::move(txn))) {
                 std::cerr << "Failed to write output, deactivating tracking" << std::endl;
                 Tracker::deactivate();
                 break;
@@ -471,9 +467,10 @@ Tracker::trackAllocationImpl(void* ptr, size_t size, hooks::Allocator func)
     auto& python_stack_tracker = t_python_stack_tracker;
     int lineno = python_stack_tracker.getCurrentPythonLineNumber();
 
+    Transaction txn = d_writer->startTransaction();
     python_stack_tracker.setMostRecentFrameLineNumber(lineno);
-    python_stack_tracker.emitPendingPops();
-    python_stack_tracker.emitPendingPushes();
+    python_stack_tracker.emitPendingPops(txn);
+    python_stack_tracker.emitPendingPushes(txn);
 
     if (d_unwind_native_frames) {
         NativeTrace trace;
@@ -481,24 +478,22 @@ Tracker::trackAllocationImpl(void* ptr, size_t size, hooks::Allocator func)
         // Skip the internal frames so we don't need to filter them later.
         if (trace.fill(2)) {
             native_index = d_native_trace_tree.getTraceIndex(trace, [&](frame_id_t ip, uint32_t index) {
-                return d_writer->writeRecord(
-                        RecordType::NATIVE_TRACE_INDEX,
-                        UnresolvedNativeFrame{ip, index});
+                txn.writeRecord(RecordType::NATIVE_TRACE_INDEX, UnresolvedNativeFrame{ip, index});
+                return true;
             });
         }
         NativeAllocationRecord
                 record{thread_id(), reinterpret_cast<uintptr_t>(ptr), size, func, native_index};
-        if (!d_writer->writeRecord(RecordType::ALLOCATION_WITH_NATIVE, record)) {
-            std::cerr << "Failed to write output, deactivating tracking" << std::endl;
-            deactivate();
-        }
+        txn.writeRecord(RecordType::ALLOCATION_WITH_NATIVE, record);
 
     } else {
         AllocationRecord record{thread_id(), reinterpret_cast<uintptr_t>(ptr), size, func};
-        if (!d_writer->writeRecord(RecordType::ALLOCATION, record)) {
-            std::cerr << "Failed to write output, deactivating tracking" << std::endl;
-            deactivate();
-        }
+        txn.writeRecord(RecordType::ALLOCATION, record);
+    }
+
+    if (!d_writer->commitTransaction(std::move(txn))) {
+        std::cerr << "Failed to write output, deactivating tracking" << std::endl;
+        deactivate();
     }
 }
 
@@ -514,12 +509,14 @@ Tracker::trackDeallocationImpl(void* ptr, size_t size, hooks::Allocator func)
     auto& python_stack_tracker = t_python_stack_tracker;
     int lineno = python_stack_tracker.getCurrentPythonLineNumber();
 
+    Transaction txn = d_writer->startTransaction();
     python_stack_tracker.setMostRecentFrameLineNumber(lineno);
-    python_stack_tracker.emitPendingPops();
-    python_stack_tracker.emitPendingPushes();
+    python_stack_tracker.emitPendingPops(txn);
+    python_stack_tracker.emitPendingPushes(txn);
 
     AllocationRecord record{thread_id(), reinterpret_cast<uintptr_t>(ptr), size, func};
-    if (!d_writer->writeRecord(RecordType::ALLOCATION, record)) {
+    txn.writeRecord(RecordType::ALLOCATION, record);
+    if (!d_writer->commitTransaction(std::move(txn))) {
         std::cerr << "Failed to write output, deactivating tracking" << std::endl;
         deactivate();
     }
@@ -536,7 +533,7 @@ Tracker::invalidate_module_cache_impl()
 static int
 dl_iterate_phdr_callback(struct dl_phdr_info* info, [[maybe_unused]] size_t size, void* data)
 {
-    auto writer = reinterpret_cast<RecordWriter*>(data);
+    auto txn = reinterpret_cast<Transaction*>(data);
     const char* filename = info->dlpi_name;
     std::string executable;
     assert(filename != nullptr);
@@ -557,21 +554,12 @@ dl_iterate_phdr_callback(struct dl_phdr_info* info, [[maybe_unused]] size_t size
         }
     }
 
-    if (!writer->writeRecordUnsafe(
-                RecordType::SEGMENT_HEADER,
-                SegmentHeader{filename, segments.size(), info->dlpi_addr}))
-    {
-        std::cerr << "memray: Failed to write output, deactivating tracking" << std::endl;
-        Tracker::deactivate();
-        return 1;
-    }
+    txn->writeRecord(
+            RecordType::SEGMENT_HEADER,
+            SegmentHeader{filename, segments.size(), info->dlpi_addr});
 
     for (const auto& segment : segments) {
-        if (!writer->writeRecordUnsafe(RecordType::SEGMENT, segment)) {
-            std::cerr << "memray: Failed to write output, deactivating tracking" << std::endl;
-            Tracker::deactivate();
-            return 1;
-        }
+        txn->writeRecord(RecordType::SEGMENT, segment);
     }
 
     return 0;
@@ -580,68 +568,61 @@ dl_iterate_phdr_callback(struct dl_phdr_info* info, [[maybe_unused]] size_t size
 void
 Tracker::updateModuleCacheImpl()
 {
+    RecursionGuard guard;
     if (!d_unwind_native_frames) {
         return;
     }
-    auto writer_lock = d_writer->acquireLock();
-    if (!d_writer->writeSimpleType(RecordType::MEMORY_MAP_START)) {
+    Transaction txn = d_writer->startTransaction();
+    txn.writeSimpleType(RecordType::MEMORY_MAP_START);
+    dl_iterate_phdr(&dl_iterate_phdr_callback, &txn);
+    if (!d_writer->commitTransaction(std::move(txn))) {
         std::cerr << "memray: Failed to write output, deactivating tracking" << std::endl;
         deactivate();
     }
-
-    dl_iterate_phdr(&dl_iterate_phdr_callback, d_writer.get());
 }
 
 void
 Tracker::registerThreadNameImpl(const char* name)
 {
-    if (!d_writer->writeRecord(RecordType::THREAD_RECORD, ThreadRecord{thread_id(), name})) {
+    RecursionGuard guard;
+    Transaction txn = d_writer->startTransaction();
+    txn.writeRecord(RecordType::THREAD_RECORD, ThreadRecord{thread_id(), name});
+    if (!d_writer->commitTransaction(std::move(txn))) {
         std::cerr << "memray: Failed to write output, deactivating tracking" << std::endl;
         deactivate();
     }
 }
 
 frame_id_t
-Tracker::registerFrame(const RawFrame& frame)
+Tracker::registerFrame(Transaction& txn, const RawFrame& frame)
 {
     const auto [frame_id, is_new_frame] = d_frames.getIndex(frame);
     if (is_new_frame) {
         pyrawframe_map_val_t frame_index{frame_id, frame};
-        if (!d_writer->writeRecord(RecordType::FRAME_INDEX, frame_index)) {
-            std::cerr << "memray: Failed to write output, deactivating tracking" << std::endl;
-            deactivate();
-        }
+        txn.writeRecord(RecordType::FRAME_INDEX, frame_index);
     }
     return frame_id;
 }
 
 bool
-Tracker::popFrames(uint32_t count)
+Tracker::popFrames(Transaction& txn, uint32_t count)
 {
     while (count) {
         uint8_t to_pop = (count > 255 ? 255 : count);
         count -= to_pop;
 
         const FramePop entry{thread_id(), to_pop};
-        if (!d_writer->writeRecord(RecordType::FRAME_POP, entry)) {
-            std::cerr << "memray: Failed to write output, deactivating tracking" << std::endl;
-            deactivate();
-            return false;
-        }
+        txn.writeRecord(RecordType::FRAME_POP, entry);
     }
     return true;
 }
 
 bool
-Tracker::pushFrame(const RawFrame& frame)
+Tracker::pushFrame(Transaction& txn, const RawFrame& frame)
 {
-    const frame_id_t frame_id = registerFrame(frame);
+    const frame_id_t frame_id = registerFrame(txn, frame);
     const FramePush entry{frame_id, thread_id()};
-    if (!d_writer->writeRecord(RecordType::FRAME_PUSH, entry)) {
-        std::cerr << "memray: Failed to write output, deactivating tracking" << std::endl;
-        deactivate();
-        return false;
-    }
+    txn.writeRecord(RecordType::FRAME_PUSH, entry);
     return true;
 }
 

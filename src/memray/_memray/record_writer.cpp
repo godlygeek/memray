@@ -31,6 +31,11 @@ getPythonAllocator()
     return PythonAllocatorType::PYTHONALLOCATOR_OTHER;
 }
 
+Transaction::Transaction(std::vector<char>&& buffer)
+: d_buffer(buffer)
+{
+}
+
 RecordWriter::RecordWriter(
         std::unique_ptr<memray::io::Sink> sink,
         const std::string& command_line,
@@ -63,14 +68,42 @@ RecordWriter::writeHeader(bool seek_to_start)
 
     d_stats.end_time = duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
     d_header.stats = d_stats;
-    if (!writeSimpleType(d_header.magic) or !writeSimpleType(d_header.version)
-        or !writeSimpleType(d_header.native_traces) or !writeSimpleType(d_header.stats)
-        or !writeString(d_header.command_line.c_str()) or !writeSimpleType(d_header.pid)
-        or !writeSimpleType(d_header.python_allocator))
-    {
-        return false;
+
+    const HeaderRecord& h = d_header;
+    return d_sink->writeAll(reinterpret_cast<const char*>(&h.magic), sizeof(h.magic))
+           && d_sink->writeAll(reinterpret_cast<const char*>(&h.version), sizeof(h.version))
+           && d_sink->writeAll(reinterpret_cast<const char*>(&h.native_traces), sizeof(h.native_traces))
+           && d_sink->writeAll(reinterpret_cast<const char*>(&h.stats), sizeof(h.stats))
+           && d_sink->writeAll(h.command_line.c_str(), strlen(h.command_line.c_str()) + 1)
+           && d_sink->writeAll(reinterpret_cast<const char*>(&h.pid), sizeof(h.pid))
+           && d_sink->writeAll(
+                   reinterpret_cast<const char*>(&h.python_allocator),
+                   sizeof(h.python_allocator));
+}
+
+Transaction
+RecordWriter::startTransaction()
+{
+    std::lock_guard<std::mutex> lock(d_mutex);
+    if (d_transactionBuffers.empty()) {
+        d_transactionBuffers.emplace_back();
+        d_transactionBuffers.back().reserve(1024);
     }
-    return true;
+    std::vector<char> buf = std::move(d_transactionBuffers.back());
+    d_transactionBuffers.pop_back();
+    buf.clear();
+    return Transaction(std::move(buf));
+}
+
+bool
+RecordWriter::commitTransaction(Transaction&& transaction)
+{
+    std::lock_guard<std::mutex> lock(d_mutex);
+    d_stats.n_allocations += transaction.d_numAllocations;
+    d_stats.n_frames += transaction.d_numFrames;
+    bool ret = d_sink->writeAll(&transaction.d_buffer[0], transaction.d_buffer.size());
+    d_transactionBuffers.push_back(std::move(transaction.d_buffer));
+    return ret;
 }
 
 std::unique_lock<std::mutex>
