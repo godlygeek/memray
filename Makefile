@@ -78,7 +78,6 @@ pycoverage:  ## Run the test suite, with Python code coverage
 		--cov=tests \
 		--cov-config=tox.ini \
 		--cov-report=term \
-		--cov-fail-under=80 \
 		--cov-append $(PYTEST_ARGS) \
 		tests
 
