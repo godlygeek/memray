@@ -428,6 +428,9 @@ cdef class FileReader:
 
         reader.close()
 
+    def get_high_watermark_index(self):
+        return self._high_watermark.index
+
     def get_high_watermark_allocation_records(self, merge_threads=True):
         self._ensure_not_closed()
         # If allocation 0 caused the peak, we need to process 1 record, etc
