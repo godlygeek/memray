@@ -84,6 +84,11 @@ FileSink::FileSink(const std::string& file_name, bool overwrite, bool compress)
     if (d_fd < 0) {
         throw IoError{"Could not create output file " + file_name + ": " + std::string(strerror(errno))};
     }
+    d_header = static_cast<tracking_api::HeaderRecord*>(
+            mmap(nullptr, sizeof(*d_header), PROT_READ | PROT_WRITE, MAP_SHARED, d_fd, 0));
+    if (!d_header) {
+        throw IoError{"Can't map output file " + file_name + " header: " + std::string(strerror(errno))};
+    }
 }
 
 bool
@@ -211,6 +216,9 @@ FileSink::~FileSink()
             LOG(ERROR) << "Failed to unmap output file: " << strerror(errno);
         }
         d_buffer = d_bufferNeedle = d_bufferEnd = nullptr;
+    }
+    if (0 != munmap(d_header, sizeof(*d_header))) {
+        LOG(ERROR) << "Failed to unmap output file header: " << strerror(errno);
     }
     if (d_fd != -1) {
         ::close(d_fd);

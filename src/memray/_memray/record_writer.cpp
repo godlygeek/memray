@@ -38,13 +38,20 @@ RecordWriter::RecordWriter(
 : d_sink(std::move(sink))
 , d_command_line(command_line)
 {
-    TrackerStats stats{
-            0,
-            0,
-            duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count()};
+    TrackerStats stats{};
+    stats.start_time = stats.end_time =
+            duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
     d_static_header =
             HeaderRecord{"", d_version, native_traces, stats, ::getpid(), getPythonAllocator()};
     strncpy(d_static_header.magic, MAGIC, sizeof(d_static_header.magic));
+}
+
+RecordWriter::~RecordWriter()
+{
+    if (d_updateable_header) {
+        d_updateable_header->stats.end_time =
+                duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
+    }
 }
 
 bool
@@ -54,6 +61,7 @@ RecordWriter::writeHeader()
     if (!writeSimpleType(d_static_header) || !writeString(d_command_line.c_str())) {
         return false;
     }
+    d_updateable_header = d_sink->memoryMappedHeader();
     return true;
 }
 

@@ -15,6 +15,11 @@ class Sink
     virtual ~Sink(){};
     virtual bool writeAll(const char* data, size_t length) = 0;
     virtual std::unique_ptr<Sink> cloneInChildProcess() = 0;
+
+    virtual tracking_api::HeaderRecord* memoryMappedHeader()
+    {
+        return nullptr;
+    }
 };
 
 class FileSink : public memray::io::Sink
@@ -29,6 +34,11 @@ class FileSink : public memray::io::Sink
 
     bool writeAll(const char* data, size_t length) override;
     std::unique_ptr<Sink> cloneInChildProcess() override;
+
+    tracking_api::HeaderRecord* memoryMappedHeader() override
+    {
+        return d_header;
+    }
 
   private:
     bool seek(off_t offset, int whence);
@@ -47,6 +57,7 @@ class FileSink : public memray::io::Sink
     char* d_buffer{nullptr};
     char* d_bufferEnd{nullptr};  // exclusive
     char* d_bufferNeedle{nullptr};
+    tracking_api::HeaderRecord* d_header{nullptr};
 };
 
 class SocketSink : public Sink

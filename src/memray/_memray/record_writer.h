@@ -26,6 +26,8 @@ class RecordWriter
     void operator=(const RecordWriter&) = delete;
     void operator=(RecordWriter&&) = delete;
 
+    ~RecordWriter();
+
     template<typename T>
     bool inline writeSimpleType(const T& item);
     bool inline writeString(const char* the_string);
@@ -60,6 +62,7 @@ class RecordWriter
     std::unique_ptr<memray::io::Sink> d_sink;
     std::mutex d_mutex;
     HeaderRecord d_static_header{};
+    HeaderRecord* d_updateable_header{nullptr};
     std::string d_command_line;
     DeltaEncodedFields d_last;
 };
@@ -184,6 +187,9 @@ bool inline RecordWriter::writeRecordUnsafe(const Segment& record)
 
 bool inline RecordWriter::writeRecordUnsafe(const AllocationRecord& record)
 {
+    if (d_updateable_header) {
+        d_updateable_header->stats.n_allocations += 1;
+    }
     RecordTypeAndFlags token{RecordType::ALLOCATION, static_cast<unsigned char>(record.allocator)};
     return writeSimpleType(token) && writeIntegralDelta(&d_last.data_pointer, record.address)
            && (hooks::allocatorKind(record.allocator) == hooks::AllocatorKind::SIMPLE_DEALLOCATOR
@@ -192,6 +198,9 @@ bool inline RecordWriter::writeRecordUnsafe(const AllocationRecord& record)
 
 bool inline RecordWriter::writeRecordUnsafe(const NativeAllocationRecord& record)
 {
+    if (d_updateable_header) {
+        d_updateable_header->stats.n_allocations += 1;
+    }
     RecordTypeAndFlags token{
             RecordType::ALLOCATION_WITH_NATIVE,
             static_cast<unsigned char>(record.allocator)};
@@ -202,6 +211,9 @@ bool inline RecordWriter::writeRecordUnsafe(const NativeAllocationRecord& record
 
 bool inline RecordWriter::writeRecordUnsafe(const pyrawframe_map_val_t& item)
 {
+    if (d_updateable_header) {
+        d_updateable_header->stats.n_frames += 1;
+    }
     RecordTypeAndFlags token{RecordType::FRAME_INDEX, 0};
     return writeSimpleType(token) && writeIntegralDelta(&d_last.python_frame_id, item.first)
            && writeString(item.second.function_name) && writeString(item.second.filename)
