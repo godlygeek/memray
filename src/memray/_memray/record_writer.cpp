@@ -36,37 +36,32 @@ RecordWriter::RecordWriter(
         const std::string& command_line,
         bool native_traces)
 : d_sink(std::move(sink))
-, d_stats({0, 0, duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count()})
 {
-    d_header = HeaderRecord{
+    TrackerStats stats{
+            0,
+            0,
+            duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count()};
+    d_static_header = HeaderRecord{
             "",
             d_version,
             native_traces,
-            d_stats,
+            stats,
             command_line,
             ::getpid(),
             getPythonAllocator()};
-    strncpy(d_header.magic, MAGIC, sizeof(d_header.magic));
+    strncpy(d_static_header.magic, MAGIC, sizeof(d_static_header.magic));
 }
 
 bool
-RecordWriter::writeHeader(bool seek_to_start)
+RecordWriter::writeHeader()
 {
     std::lock_guard<std::mutex> lock(d_mutex);
-    if (seek_to_start) {
-        // If we can't seek to the beginning to the stream (e.g. dealing with a socket), just give
-        // up.
-        if (!d_sink->seek(0, SEEK_SET)) {
-            return false;
-        }
-    }
-
-    d_stats.end_time = duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
-    d_header.stats = d_stats;
-    if (!writeSimpleType(d_header.magic) or !writeSimpleType(d_header.version)
-        or !writeSimpleType(d_header.native_traces) or !writeSimpleType(d_header.stats)
-        or !writeString(d_header.command_line.c_str()) or !writeSimpleType(d_header.pid)
-        or !writeSimpleType(d_header.python_allocator))
+    d_static_header.stats.end_time =
+            duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
+    if (!writeSimpleType(d_static_header.magic) or !writeSimpleType(d_static_header.version)
+        or !writeSimpleType(d_static_header.native_traces) or !writeSimpleType(d_static_header.stats)
+        or !writeString(d_static_header.command_line.c_str()) or !writeSimpleType(d_static_header.pid)
+        or !writeSimpleType(d_static_header.python_allocator))
     {
         return false;
     }
@@ -88,8 +83,8 @@ RecordWriter::cloneInChildProcess()
     }
     return std::make_unique<RecordWriter>(
             std::move(new_sink),
-            d_header.command_line,
-            d_header.native_traces);
+            d_static_header.command_line,
+            d_static_header.native_traces);
 }
 
 }  // namespace memray::tracking_api

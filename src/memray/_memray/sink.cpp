@@ -275,12 +275,6 @@ SocketSink::flush()
     return true;
 }
 
-bool
-SocketSink::seek(__attribute__((unused)) off_t offset, __attribute__((unused)) int whence)
-{
-    return false;
-}
-
 std::unique_ptr<Sink>
 SocketSink::cloneInChildProcess()
 {
@@ -364,12 +358,6 @@ NullSink::~NullSink()
 
 bool
 NullSink::writeAll(const char*, size_t)
-{
-    return true;
-}
-
-bool
-NullSink::seek(off_t, int)
 {
     return true;
 }

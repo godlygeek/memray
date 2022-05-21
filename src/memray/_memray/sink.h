@@ -14,7 +14,6 @@ class Sink
   public:
     virtual ~Sink(){};
     virtual bool writeAll(const char* data, size_t length) = 0;
-    virtual bool seek(off_t offset, int whence) = 0;
     virtual std::unique_ptr<Sink> cloneInChildProcess() = 0;
 };
 
@@ -29,10 +28,10 @@ class FileSink : public memray::io::Sink
     void operator=(const FileSink&&) = delete;
 
     bool writeAll(const char* data, size_t length) override;
-    bool seek(off_t offset, int whence) override;
     std::unique_ptr<Sink> cloneInChildProcess() override;
 
   private:
+    bool seek(off_t offset, int whence);
     void compress() noexcept;
     bool grow(size_t needed);
     bool slideWindow();
@@ -62,7 +61,6 @@ class SocketSink : public Sink
     void operator=(const SocketSink&&) = delete;
 
     bool writeAll(const char* data, size_t length) override;
-    bool seek(off_t offset, int whence) override;
     std::unique_ptr<Sink> cloneInChildProcess() override;
 
   private:
@@ -85,7 +83,6 @@ class NullSink : public Sink
   public:
     ~NullSink() override;
     bool writeAll(const char* data, size_t length) override;
-    bool seek(off_t offset, int whence) override;
     std::unique_ptr<Sink> cloneInChildProcess() override;
 };
 
