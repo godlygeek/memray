@@ -36,19 +36,14 @@ RecordWriter::RecordWriter(
         const std::string& command_line,
         bool native_traces)
 : d_sink(std::move(sink))
+, d_command_line(command_line)
 {
     TrackerStats stats{
             0,
             0,
             duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count()};
-    d_static_header = HeaderRecord{
-            "",
-            d_version,
-            native_traces,
-            stats,
-            command_line,
-            ::getpid(),
-            getPythonAllocator()};
+    d_static_header =
+            HeaderRecord{"", d_version, native_traces, stats, ::getpid(), getPythonAllocator()};
     strncpy(d_static_header.magic, MAGIC, sizeof(d_static_header.magic));
 }
 
@@ -56,13 +51,7 @@ bool
 RecordWriter::writeHeader()
 {
     std::lock_guard<std::mutex> lock(d_mutex);
-    d_static_header.stats.end_time =
-            duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
-    if (!writeSimpleType(d_static_header.magic) or !writeSimpleType(d_static_header.version)
-        or !writeSimpleType(d_static_header.native_traces) or !writeSimpleType(d_static_header.stats)
-        or !writeString(d_static_header.command_line.c_str()) or !writeSimpleType(d_static_header.pid)
-        or !writeSimpleType(d_static_header.python_allocator))
-    {
+    if (!writeSimpleType(d_static_header) || !writeString(d_command_line.c_str())) {
         return false;
     }
     return true;
@@ -83,7 +72,7 @@ RecordWriter::cloneInChildProcess()
     }
     return std::make_unique<RecordWriter>(
             std::move(new_sink),
-            d_static_header.command_line,
+            d_command_line,
             d_static_header.native_traces);
 }
 

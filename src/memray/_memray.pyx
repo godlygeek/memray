@@ -434,6 +434,7 @@ cdef class FileReader:
     cdef vector[_MemoryRecord] _memory_records
     cdef HighWatermark _high_watermark
     cdef object _header
+    cdef cppstring _command_line
     cdef bool _report_progress
 
     def __cinit__(self, object file_name, *, bool report_progress=False):
@@ -453,6 +454,7 @@ cdef class FileReader:
         cdef RecordReader* reader = reader_sp.get()
 
         self._header = reader.getHeader()
+        self._command_line = reader.getCommandLine()
         stats = self._header["stats"]
 
         n_memory_records_approx = 2048
@@ -594,7 +596,7 @@ cdef class FileReader:
                         total_allocations=stats["n_allocations"],
                         total_frames=stats["n_frames"],
                         peak_memory=self._high_watermark.peak_memory,
-                        command_line=self._header["command_line"],
+                        command_line=self._command_line,
                         pid=self._header["pid"],
                         python_allocator=python_allocator,
                         has_native_traces=self._header["native_traces"])
@@ -614,6 +616,7 @@ cdef class SocketReader:
     cdef BackgroundSocketReader* _impl
     cdef shared_ptr[RecordReader] _reader
     cdef object _header
+    cdef cppstring _command_line
     cdef object _port
 
     def __cinit__(self, int port):
@@ -644,6 +647,7 @@ cdef class SocketReader:
 
         self._reader = make_shared[RecordReader](move(self._make_source()))
         self._header = self._reader.get().getHeader()
+        self._command_line = self._reader.get().getCommandLine()
 
         self._impl = new BackgroundSocketReader(self._reader)
         self._impl.start()
@@ -664,7 +668,7 @@ cdef class SocketReader:
     def command_line(self):
         if not self._header:
             return None
-        return self._header["command_line"]
+        return self._command_line
 
     @property
     def is_active(self):

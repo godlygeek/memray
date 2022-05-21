@@ -26,6 +26,7 @@ cdef extern from "record_reader.h" namespace "memray::api":
         object Py_GetNativeStackFrame(int frame_id, size_t generation) except+
         object Py_GetNativeStackFrame(int frame_id, size_t generation, size_t max_stacks) except+
         HeaderRecord getHeader()
+        string getCommandLine()
         object dumpAllRecords() except+
         string getThreadName(long int tid) except+
         Allocation getLatestAllocation()

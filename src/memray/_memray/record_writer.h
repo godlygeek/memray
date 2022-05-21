@@ -60,6 +60,7 @@ class RecordWriter
     std::unique_ptr<memray::io::Sink> d_sink;
     std::mutex d_mutex;
     HeaderRecord d_static_header{};
+    std::string d_command_line;
     DeltaEncodedFields d_last;
 };
 

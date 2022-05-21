@@ -28,7 +28,6 @@ cdef extern from "records.h" namespace "memray::tracking_api":
        int version
        bool native_traces
        TrackerStats stats
-       string command_line
        int pid
        int python_allocator
 

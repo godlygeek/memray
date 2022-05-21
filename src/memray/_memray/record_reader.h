@@ -46,6 +46,7 @@ class RecordReader
 
     RecordResult nextRecord();
     HeaderRecord getHeader() const noexcept;
+    const std::string& getCommandLine() const noexcept;
     PyObject* dumpAllRecords();
     std::string getThreadName(thread_id_t tid);
     Allocation getLatestAllocation() const noexcept;
@@ -57,7 +58,7 @@ class RecordReader
     using stack_traces_t = std::unordered_map<thread_id_t, stack_t>;
 
     // Private methods
-    void readHeader(HeaderRecord& header);
+    void readHeader();
     template<typename T>
     bool readVarint(T* val);
     bool readVarint(size_t* val);
@@ -72,6 +73,7 @@ class RecordReader
     std::unique_ptr<memray::io::Source> d_input;
     const bool d_track_stacks;
     HeaderRecord d_header;
+    std::string d_command_line;
     pyframe_map_t d_frame_map{};
     FrameCollection<Frame> d_allocation_frames{1, 2};
     stack_traces_t d_stack_traces{};

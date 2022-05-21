@@ -43,7 +43,7 @@ def test_rejects_different_header_version(tmp_path):
     # Change the header version to zero
     with output.open("rb+") as f:
         f.seek(7)
-        f.write(b"\0")
+        f.write(b"\0\0\0\0")
 
     # THEN
     with pytest.raises(OSError, match="incompatible with this version"):

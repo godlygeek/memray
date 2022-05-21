@@ -14,7 +14,7 @@
 namespace memray::tracking_api {
 
 const char MAGIC[] = "memray";
-const int CURRENT_HEADER_VERSION = 7;
+const int CURRENT_HEADER_VERSION = 8;
 
 using frame_id_t = size_t;
 using thread_id_t = unsigned long;
@@ -80,7 +80,6 @@ struct HeaderRecord
     int version{};
     bool native_traces{false};
     TrackerStats stats{};
-    std::string command_line;
     int pid{-1};
     PythonAllocatorType python_allocator;
 };
