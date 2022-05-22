@@ -61,6 +61,7 @@ static_assert(sizeof(RecordTypeAndFlags) == 1);
 
 struct TrackerStats
 {
+    size_t n_records{0};
     size_t n_allocations{0};
     size_t n_frames{0};
     millis_t start_time{};

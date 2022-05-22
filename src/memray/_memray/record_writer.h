@@ -123,6 +123,9 @@ bool inline RecordWriter::writeRecord(const T& item)
     if (!writeRecordUnsafe(item)) {
         return false;
     }
+    if (d_updateable_header) {
+        d_updateable_header->stats.n_records += 1;
+    }
     return true;
 }
 
@@ -135,9 +138,15 @@ bool inline RecordWriter::writeThreadSpecificRecord(thread_id_t tid, const T& it
         if (!writeRecordUnsafe(ContextSwitch{tid})) {
             return false;
         }
+        if (d_updateable_header) {
+            d_updateable_header->stats.n_records += 1;
+        }
     }
     if (!writeRecordUnsafe(item)) {
         return false;
+    }
+    if (d_updateable_header) {
+        d_updateable_header->stats.n_records += 1;
     }
     return true;
 }

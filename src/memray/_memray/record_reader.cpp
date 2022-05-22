@@ -647,12 +647,13 @@ RecordReader::dumpAllRecords()
             break;
     }
     printf("HEADER magic=%.*s version=%d native_traces=%s"
-           " n_allocations=%zd n_frames=%zd start_time=%lld end_time=%lld"
+           " n_records=%zd n_allocations=%zd n_frames=%zd start_time=%lld end_time=%lld"
            " pid=%d command_line=%s python_allocator=%s\n",
            (int)sizeof(d_header.magic),
            d_header.magic,
            d_header.version,
            d_header.native_traces ? "true" : "false",
+           d_header.stats.n_records,
            d_header.stats.n_allocations,
            d_header.stats.n_frames,
            d_header.stats.start_time,

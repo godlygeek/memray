@@ -73,6 +73,7 @@ class RecordReader
     std::unique_ptr<memray::io::Source> d_input;
     const bool d_track_stacks;
     HeaderRecord d_header;
+    size_t d_records_read{};
     std::string d_command_line;
     pyframe_map_t d_frame_map{};
     FrameCollection<Frame> d_allocation_frames{1, 2};
