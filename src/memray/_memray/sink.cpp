@@ -107,14 +107,12 @@ FileSink::seek(off_t offset, int whence)
         return false;
     }
 
-    // Free our existing buffer, if any
-    if (d_buffer && 0 != munmap(d_buffer, BUFFER_SIZE)) {
-        return false;
-    }
+    int reuse_if_mapped = d_buffer ? MAP_FIXED : 0;
 
     // Note: It is OK to map beyond the end of the file,
     //       though not to write beyond the end.
-    d_buffer = static_cast<char*>(mmap(d_buffer, BUFFER_SIZE, PROT_WRITE, MAP_SHARED, d_fd, offset));
+    d_buffer = static_cast<char*>(
+            mmap(d_buffer, BUFFER_SIZE, PROT_WRITE, MAP_SHARED | reuse_if_mapped, d_fd, offset));
     if (d_buffer == MAP_FAILED) {
         d_buffer = nullptr;
         return false;
