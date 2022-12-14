@@ -11,6 +11,7 @@
 #include <tuple>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 #include "hooks.h"
 #include "python_helpers.h"
@@ -152,6 +153,13 @@ struct Segment
 {
     uintptr_t vaddr;
     uintptr_t memsz;
+};
+
+struct ImageSegments
+{
+    std::string filename;
+    uintptr_t addr;
+    std::vector<Segment> segments;
 };
 
 struct RawFrame
