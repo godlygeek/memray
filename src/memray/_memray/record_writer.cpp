@@ -93,12 +93,6 @@ RecordWriter::writeTrailer()
     return writeSimpleType(token);
 }
 
-std::unique_lock<std::mutex>
-RecordWriter::acquireLock()
-{
-    return std::unique_lock<std::mutex>(d_mutex);
-}
-
 std::unique_ptr<RecordWriter>
 RecordWriter::cloneInChildProcess()
 {

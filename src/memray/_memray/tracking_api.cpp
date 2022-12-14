@@ -840,7 +840,7 @@ Tracker::invalidate_module_cache_impl()
 static int
 dl_iterate_phdr_callback(struct dl_phdr_info* info, [[maybe_unused]] size_t size, void* data)
 {
-    auto writer = reinterpret_cast<RecordWriter*>(data);
+    auto& mappings = *reinterpret_cast<std::vector<ImageSegments>*>(data);
     const char* filename = info->dlpi_name;
     std::string executable;
     assert(filename != nullptr);
@@ -861,20 +861,7 @@ dl_iterate_phdr_callback(struct dl_phdr_info* info, [[maybe_unused]] size_t size
         }
     }
 
-    if (!writer->writeRecordUnsafe(SegmentHeader{filename, segments.size(), info->dlpi_addr})) {
-        std::cerr << "memray: Failed to write output, deactivating tracking" << std::endl;
-        Tracker::deactivate();
-        return 1;
-    }
-
-    for (const auto& segment : segments) {
-        if (!writer->writeRecordUnsafe(segment)) {
-            std::cerr << "memray: Failed to write output, deactivating tracking" << std::endl;
-            Tracker::deactivate();
-            return 1;
-        }
-    }
-
+    mappings.push_back({filename, info->dlpi_addr, std::move(segments)});
     return 0;
 }
 #endif
@@ -885,14 +872,11 @@ Tracker::updateModuleCacheImpl()
     if (!d_unwind_native_frames) {
         return;
     }
-    auto writer_lock = d_writer->acquireLock();
-    if (!d_writer->writeRecordUnsafe(MemoryMapStart{})) {
-        std::cerr << "memray: Failed to write output, deactivating tracking" << std::endl;
-        deactivate();
-    }
+
+    std::vector<ImageSegments> mappings;
 
 #ifdef __linux__
-    dl_iterate_phdr(&dl_iterate_phdr_callback, d_writer.get());
+    dl_iterate_phdr(&dl_iterate_phdr_callback, &mappings);
 #elif defined(__APPLE__)
     uint32_t c = _dyld_image_count();
     for (uint32_t i = 0; i < c; i++) {
@@ -910,21 +894,15 @@ Tracker::updateModuleCacheImpl()
             }
         }
 
-        if (!d_writer->writeRecordUnsafe(SegmentHeader{image_name, segments.size(), slide})) {
-            std::cerr << "memray: Failed to write output, deactivating tracking" << std::endl;
-            Tracker::deactivate();
-            return;
-        }
-
-        for (const auto& segment : segments) {
-            if (!d_writer->writeRecordUnsafe(segment)) {
-                std::cerr << "memray: Failed to write output, deactivating tracking" << std::endl;
-                Tracker::deactivate();
-                return;
-            }
-        }
+        mappings.push_back({image_name, slide, std::move(segments)});
     }
 #endif
+
+    if (!d_writer->writeMappings(mappings)) {
+        std::cerr << "memray: Failed to write output, deactivating tracking" << std::endl;
+        Tracker::deactivate();
+        return;
+    }
 }
 
 void
