@@ -27,27 +27,18 @@ class RecordWriter
     void operator=(const RecordWriter&) = delete;
     void operator=(RecordWriter&&) = delete;
 
-    template<typename T>
-    bool inline writeSimpleType(const T& item);
-    bool inline writeString(const char* the_string);
-    bool inline writeVarint(size_t val);
-    bool inline writeSignedVarint(ssize_t val);
-    template<typename T>
-    bool inline writeIntegralDelta(T* prev, T new_val);
-    template<typename T>
-    bool inline writeRecord(const T& item);
-    bool inline writeRecordUnsafe(const MemoryRecord& record);
-    bool inline writeRecordUnsafe(const pyrawframe_map_val_t& item);
-    bool inline writeRecordUnsafe(const UnresolvedNativeFrame& record);
+    bool inline writeRecord(const MemoryRecord& record);
+    bool inline writeRecord(const pyrawframe_map_val_t& item);
+    bool inline writeRecord(const UnresolvedNativeFrame& record);
+
     bool inline writeMappings(const std::vector<ImageSegments>& mappings);
-    template<typename T>
-    bool inline writeThreadSpecificRecord(thread_id_t tid, const T& item);
-    bool inline writeRecordUnsafe(const ContextSwitch& record);
-    bool inline writeRecordUnsafe(const FramePop& record);
-    bool inline writeRecordUnsafe(const FramePush& record);
-    bool inline writeRecordUnsafe(const AllocationRecord& record);
-    bool inline writeRecordUnsafe(const NativeAllocationRecord& record);
-    bool inline writeRecordUnsafe(const ThreadRecord& record);
+
+    bool inline writeThreadSpecificRecord(thread_id_t tid, const FramePop& record);
+    bool inline writeThreadSpecificRecord(thread_id_t tid, const FramePush& record);
+    bool inline writeThreadSpecificRecord(thread_id_t tid, const AllocationRecord& record);
+    bool inline writeThreadSpecificRecord(thread_id_t tid, const NativeAllocationRecord& record);
+    bool inline writeThreadSpecificRecord(thread_id_t tid, const ThreadRecord& record);
+
     bool writeHeader(bool seek_to_start);
     bool writeTrailer();
 
@@ -55,6 +46,16 @@ class RecordWriter
     std::unique_ptr<RecordWriter> cloneInChildProcess();
 
   private:
+    bool inline maybeWriteContextSwitchRecordUnsafe(thread_id_t tid);
+
+    template<typename T>
+    bool inline writeSimpleType(const T& item);
+    bool inline writeString(const char* the_string);
+    bool inline writeVarint(size_t val);
+    bool inline writeSignedVarint(ssize_t val);
+    template<typename T>
+    bool inline writeIntegralDelta(T* prev, T new_val);
+
     // Data members
     int d_version{CURRENT_HEADER_VERSION};
     std::unique_ptr<memray::io::Sink> d_sink;
@@ -113,22 +114,17 @@ bool inline RecordWriter::writeIntegralDelta(T* prev, T new_val)
     return writeSignedVarint(delta);
 }
 
-template<typename T>
-bool inline RecordWriter::writeRecord(const T& item)
+bool inline RecordWriter::writeRecord(const MemoryRecord& record)
 {
     std::lock_guard<std::mutex> lock(d_mutex);
-    return writeRecordUnsafe(item);
-}
-
-bool inline RecordWriter::writeRecordUnsafe(const MemoryRecord& record)
-{
     RecordTypeAndFlags token{RecordType::MEMORY_RECORD, 0};
     return writeSimpleType(token) && writeVarint(record.rss)
            && writeVarint(record.ms_since_epoch - d_stats.start_time) && d_sink->flush();
 }
 
-bool inline RecordWriter::writeRecordUnsafe(const pyrawframe_map_val_t& item)
+bool inline RecordWriter::writeRecord(const pyrawframe_map_val_t& item)
 {
+    std::lock_guard<std::mutex> lock(d_mutex);
     d_stats.n_frames += 1;
     RecordTypeAndFlags token{RecordType::FRAME_INDEX, !item.second.is_entry_frame};
     return writeSimpleType(token) && writeIntegralDelta(&d_last.python_frame_id, item.first)
@@ -136,8 +132,9 @@ bool inline RecordWriter::writeRecordUnsafe(const pyrawframe_map_val_t& item)
            && writeIntegralDelta(&d_last.python_line_number, item.second.lineno);
 }
 
-bool inline RecordWriter::writeRecordUnsafe(const UnresolvedNativeFrame& record)
+bool inline RecordWriter::writeRecord(const UnresolvedNativeFrame& record)
 {
+    std::lock_guard<std::mutex> lock(d_mutex);
     return writeSimpleType(RecordTypeAndFlags{RecordType::NATIVE_TRACE_INDEX, 0})
            && writeIntegralDelta(&d_last.instruction_pointer, record.ip)
            && writeIntegralDelta(&d_last.native_frame_id, record.index);
@@ -160,6 +157,7 @@ bool inline RecordWriter::writeMappings(const std::vector<ImageSegments>& mappin
         }
 
         RecordTypeAndFlags segment_token{RecordType::SEGMENT, 0};
+
         for (const auto& segment : image.segments) {
             if (!writeSimpleType(segment_token) || !writeSimpleType(segment.vaddr)
                 || !writeVarint(segment.memsz))
@@ -172,27 +170,25 @@ bool inline RecordWriter::writeMappings(const std::vector<ImageSegments>& mappin
     return true;
 }
 
-template<typename T>
-bool inline RecordWriter::writeThreadSpecificRecord(thread_id_t tid, const T& item)
+bool inline RecordWriter::maybeWriteContextSwitchRecordUnsafe(thread_id_t tid)
 {
-    std::lock_guard<std::mutex> lock(d_mutex);
-    if (d_last.thread_id != tid) {
-        d_last.thread_id = tid;
-        if (!writeRecordUnsafe(ContextSwitch{tid})) {
-            return false;
-        }
+    if (d_last.thread_id == tid) {
+        return true;  // nothing to do.
     }
-    return writeRecordUnsafe(item);
-}
+    d_last.thread_id = tid;
 
-bool inline RecordWriter::writeRecordUnsafe(const ContextSwitch& record)
-{
     RecordTypeAndFlags token{RecordType::CONTEXT_SWITCH, 0};
+    ContextSwitch record{tid};
     return writeSimpleType(token) && writeSimpleType(record);
 }
 
-bool inline RecordWriter::writeRecordUnsafe(const FramePop& record)
+bool inline RecordWriter::writeThreadSpecificRecord(thread_id_t tid, const FramePop& record)
 {
+    std::lock_guard<std::mutex> lock(d_mutex);
+    if (!maybeWriteContextSwitchRecordUnsafe(tid)) {
+        return false;
+    }
+
     size_t count = record.count;
     while (count) {
         uint8_t to_pop = (count > 16 ? 16 : count);
@@ -209,14 +205,24 @@ bool inline RecordWriter::writeRecordUnsafe(const FramePop& record)
     return true;
 }
 
-bool inline RecordWriter::writeRecordUnsafe(const FramePush& record)
+bool inline RecordWriter::writeThreadSpecificRecord(thread_id_t tid, const FramePush& record)
 {
+    std::lock_guard<std::mutex> lock(d_mutex);
+    if (!maybeWriteContextSwitchRecordUnsafe(tid)) {
+        return false;
+    }
+
     RecordTypeAndFlags token{RecordType::FRAME_PUSH, 0};
     return writeSimpleType(token) && writeIntegralDelta(&d_last.python_frame_id, record.frame_id);
 }
 
-bool inline RecordWriter::writeRecordUnsafe(const AllocationRecord& record)
+bool inline RecordWriter::writeThreadSpecificRecord(thread_id_t tid, const AllocationRecord& record)
 {
+    std::lock_guard<std::mutex> lock(d_mutex);
+    if (!maybeWriteContextSwitchRecordUnsafe(tid)) {
+        return false;
+    }
+
     d_stats.n_allocations += 1;
     RecordTypeAndFlags token{RecordType::ALLOCATION, static_cast<unsigned char>(record.allocator)};
     return writeSimpleType(token) && writeIntegralDelta(&d_last.data_pointer, record.address)
@@ -224,8 +230,15 @@ bool inline RecordWriter::writeRecordUnsafe(const AllocationRecord& record)
                || writeVarint(record.size));
 }
 
-bool inline RecordWriter::writeRecordUnsafe(const NativeAllocationRecord& record)
+bool inline RecordWriter::writeThreadSpecificRecord(
+        thread_id_t tid,
+        const NativeAllocationRecord& record)
 {
+    std::lock_guard<std::mutex> lock(d_mutex);
+    if (!maybeWriteContextSwitchRecordUnsafe(tid)) {
+        return false;
+    }
+
     d_stats.n_allocations += 1;
     RecordTypeAndFlags token{
             RecordType::ALLOCATION_WITH_NATIVE,
@@ -235,8 +248,13 @@ bool inline RecordWriter::writeRecordUnsafe(const NativeAllocationRecord& record
            && writeIntegralDelta(&d_last.native_frame_id, record.native_frame_id);
 }
 
-bool inline RecordWriter::writeRecordUnsafe(const ThreadRecord& record)
+bool inline RecordWriter::writeThreadSpecificRecord(thread_id_t tid, const ThreadRecord& record)
 {
+    std::lock_guard<std::mutex> lock(d_mutex);
+    if (!maybeWriteContextSwitchRecordUnsafe(tid)) {
+        return false;
+    }
+
     RecordTypeAndFlags token{RecordType::THREAD_RECORD, 0};
     return writeSimpleType(token) && writeString(record.name);
 }
