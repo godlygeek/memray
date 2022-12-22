@@ -31,7 +31,7 @@ getPythonAllocator()
     return PythonAllocatorType::PYTHONALLOCATOR_OTHER;
 }
 
-RecordWriter::RecordWriter(
+StreamingRecordWriter::StreamingRecordWriter(
         std::unique_ptr<memray::io::Sink> sink,
         const std::string& command_line,
         bool native_traces)
@@ -52,13 +52,16 @@ RecordWriter::RecordWriter(
 }
 
 void
-RecordWriter::setMainTidAndSkippedFrames(thread_id_t main_tid, size_t skipped_frames_on_main_tid)
+StreamingRecordWriter::setMainTidAndSkippedFrames(
+        thread_id_t main_tid,
+        size_t skipped_frames_on_main_tid)
 {
     d_header.main_tid = main_tid;
     d_header.skipped_frames_on_main_tid = skipped_frames_on_main_tid;
 }
 
-bool RecordWriter::writeRecord(const MemoryRecord& record)
+bool
+StreamingRecordWriter::writeRecord(const MemoryRecord& record)
 {
     std::lock_guard<std::mutex> lock(d_mutex);
     RecordTypeAndFlags token{RecordType::MEMORY_RECORD, 0};
@@ -66,7 +69,8 @@ bool RecordWriter::writeRecord(const MemoryRecord& record)
            && writeVarint(record.ms_since_epoch - d_stats.start_time) && d_sink->flush();
 }
 
-bool RecordWriter::writeRecord(const pyrawframe_map_val_t& item)
+bool
+StreamingRecordWriter::writeRecord(const pyrawframe_map_val_t& item)
 {
     std::lock_guard<std::mutex> lock(d_mutex);
     d_stats.n_frames += 1;
@@ -76,7 +80,8 @@ bool RecordWriter::writeRecord(const pyrawframe_map_val_t& item)
            && writeIntegralDelta(&d_last.python_line_number, item.second.lineno);
 }
 
-bool RecordWriter::writeRecord(const UnresolvedNativeFrame& record)
+bool
+StreamingRecordWriter::writeRecord(const UnresolvedNativeFrame& record)
 {
     std::lock_guard<std::mutex> lock(d_mutex);
     return writeSimpleType(RecordTypeAndFlags{RecordType::NATIVE_TRACE_INDEX, 0})
@@ -84,7 +89,8 @@ bool RecordWriter::writeRecord(const UnresolvedNativeFrame& record)
            && writeIntegralDelta(&d_last.native_frame_id, record.index);
 }
 
-bool RecordWriter::writeMappings(const std::vector<ImageSegments>& mappings)
+bool
+StreamingRecordWriter::writeMappings(const std::vector<ImageSegments>& mappings)
 {
     std::lock_guard<std::mutex> lock(d_mutex);
     RecordTypeAndFlags start_token{RecordType::MEMORY_MAP_START, 0};
@@ -114,7 +120,8 @@ bool RecordWriter::writeMappings(const std::vector<ImageSegments>& mappings)
     return true;
 }
 
-bool RecordWriter::maybeWriteContextSwitchRecordUnsafe(thread_id_t tid)
+bool
+StreamingRecordWriter::maybeWriteContextSwitchRecordUnsafe(thread_id_t tid)
 {
     if (d_last.thread_id == tid) {
         return true;  // nothing to do.
@@ -126,7 +133,8 @@ bool RecordWriter::maybeWriteContextSwitchRecordUnsafe(thread_id_t tid)
     return writeSimpleType(token) && writeSimpleType(record);
 }
 
-bool RecordWriter::writeThreadSpecificRecord(thread_id_t tid, const FramePop& record)
+bool
+StreamingRecordWriter::writeThreadSpecificRecord(thread_id_t tid, const FramePop& record)
 {
     std::lock_guard<std::mutex> lock(d_mutex);
     if (!maybeWriteContextSwitchRecordUnsafe(tid)) {
@@ -149,7 +157,8 @@ bool RecordWriter::writeThreadSpecificRecord(thread_id_t tid, const FramePop& re
     return true;
 }
 
-bool RecordWriter::writeThreadSpecificRecord(thread_id_t tid, const FramePush& record)
+bool
+StreamingRecordWriter::writeThreadSpecificRecord(thread_id_t tid, const FramePush& record)
 {
     std::lock_guard<std::mutex> lock(d_mutex);
     if (!maybeWriteContextSwitchRecordUnsafe(tid)) {
@@ -160,7 +169,8 @@ bool RecordWriter::writeThreadSpecificRecord(thread_id_t tid, const FramePush& r
     return writeSimpleType(token) && writeIntegralDelta(&d_last.python_frame_id, record.frame_id);
 }
 
-bool RecordWriter::writeThreadSpecificRecord(thread_id_t tid, const AllocationRecord& record)
+bool
+StreamingRecordWriter::writeThreadSpecificRecord(thread_id_t tid, const AllocationRecord& record)
 {
     std::lock_guard<std::mutex> lock(d_mutex);
     if (!maybeWriteContextSwitchRecordUnsafe(tid)) {
@@ -174,9 +184,8 @@ bool RecordWriter::writeThreadSpecificRecord(thread_id_t tid, const AllocationRe
                || writeVarint(record.size));
 }
 
-bool RecordWriter::writeThreadSpecificRecord(
-        thread_id_t tid,
-        const NativeAllocationRecord& record)
+bool
+StreamingRecordWriter::writeThreadSpecificRecord(thread_id_t tid, const NativeAllocationRecord& record)
 {
     std::lock_guard<std::mutex> lock(d_mutex);
     if (!maybeWriteContextSwitchRecordUnsafe(tid)) {
@@ -192,7 +201,8 @@ bool RecordWriter::writeThreadSpecificRecord(
            && writeIntegralDelta(&d_last.native_frame_id, record.native_frame_id);
 }
 
-bool RecordWriter::writeThreadSpecificRecord(thread_id_t tid, const ThreadRecord& record)
+bool
+StreamingRecordWriter::writeThreadSpecificRecord(thread_id_t tid, const ThreadRecord& record)
 {
     std::lock_guard<std::mutex> lock(d_mutex);
     if (!maybeWriteContextSwitchRecordUnsafe(tid)) {
@@ -204,7 +214,7 @@ bool RecordWriter::writeThreadSpecificRecord(thread_id_t tid, const ThreadRecord
 }
 
 bool
-RecordWriter::writeHeader(bool seek_to_start)
+StreamingRecordWriter::writeHeader(bool seek_to_start)
 {
     std::lock_guard<std::mutex> lock(d_mutex);
     if (seek_to_start) {
@@ -229,7 +239,7 @@ RecordWriter::writeHeader(bool seek_to_start)
 }
 
 bool
-RecordWriter::writeTrailer()
+StreamingRecordWriter::writeTrailer()
 {
     std::lock_guard<std::mutex> lock(d_mutex);
     // The FileSource will ignore trailing 0x00 bytes. This non-zero trailer
@@ -238,14 +248,14 @@ RecordWriter::writeTrailer()
     return writeSimpleType(token);
 }
 
-std::unique_ptr<RecordWriter>
-RecordWriter::cloneInChildProcess()
+std::unique_ptr<StreamingRecordWriter>
+StreamingRecordWriter::cloneInChildProcess()
 {
     std::unique_ptr<io::Sink> new_sink = d_sink->cloneInChildProcess();
     if (!new_sink) {
         return {};
     }
-    return std::make_unique<RecordWriter>(
+    return std::make_unique<StreamingRecordWriter>(
             std::move(new_sink),
             d_header.command_line,
             d_header.native_traces);
