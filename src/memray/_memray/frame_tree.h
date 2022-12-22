@@ -9,12 +9,23 @@ namespace memray::tracking_api {
 class FrameTree
 {
   public:
-    using index_t = uint32_t;
+    using index_t = uint32_t;  // TODO: Shouldn't this be size_t?
+
+    inline index_t minIndex() const
+    {
+        return 1;
+    }
+
+    inline index_t maxIndex() const
+    {
+        std::lock_guard<std::mutex> lock(d_mutex);
+        return d_graph.size() - 1;
+    }
 
     inline std::pair<frame_id_t, index_t> nextNode(index_t index) const
     {
         std::lock_guard<std::mutex> lock(d_mutex);
-        assert(1 <= index && index <= d_graph.size());
+        assert(1 <= index && index <= d_graph.size() - 1);
         return std::make_pair(d_graph[index].frame_id, d_graph[index].parent_index);
     }
 
