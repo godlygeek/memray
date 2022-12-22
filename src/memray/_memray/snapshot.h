@@ -224,6 +224,89 @@ class HighWatermarkFinder
     IntervalTree<Allocation> d_mmap_intervals;
 };
 
+// Like LocationKey, but considers the native_segment_generation and the
+// allocator to be part of the key. Arguably it's a bug that LocationKey
+// doesn't, for each of these. For now, I'm defining a separate type to avoid
+// scope creep, but we should merge these.
+struct HighWaterMarkLocationKey
+{
+    // Ordered widest field to narrowest, to avoid padding.
+    thread_id_t thread_id;
+    size_t python_frame_id;
+    size_t native_frame_id;
+    size_t native_segment_generation;
+    hooks::Allocator allocator;
+
+    bool operator==(const HighWaterMarkLocationKey& rhs) const;
+};
+
+struct HighWaterMarkLocationKeyHash
+{
+    size_t operator()(const HighWaterMarkLocationKey& p) const
+    {
+        // Keep the fewest bits from the hashes of the fields that vary least.
+        size_t ret = std::hash<hooks::Allocator>{}(p.allocator);
+        ret = (ret << 1) ^ std::hash<size_t>{}(p.native_segment_generation);
+        ret = (ret << 1) ^ std::hash<thread_id_t>{}(p.thread_id);
+        ret = (ret << 1) ^ std::hash<size_t>{}(p.native_frame_id);
+        ret = (ret << 1) ^ std::hash<size_t>{}(p.python_frame_id);
+        return ret;
+    }
+};
+
+class HighWaterMarkAggregator
+{
+  public:
+    void addAllocation(const Allocation& allocation);
+    size_t getCurrentHeapSize() const noexcept;
+
+    using allocation_callback_t = std::function<bool(const AggregatedAllocation&)>;
+    bool visitAllocations(allocation_callback_t callback) const;
+
+  private:
+    // Number of high water marks found (incremented on the falling edge)
+    uint64_t d_peak_count{};
+    size_t d_heap_size_at_last_peak{};
+    size_t d_current_heap_size{};
+
+    // This class represents allocations observed at some location over time.
+    // When an allocation or deallocation is observed, we first check if a new
+    // peak was discovered after the last time an allocation or deallocation
+    // was performed here. If so, the counters tracking what happened since the
+    // last peak must be merged into allocations_contributed_to_last_known_peak
+    // and bytes_contributed_to_last_known_peak and reset: they didn't
+    // contribute to the previous peak, but they are accounted for in the newly
+    // discovered peak. Finally, we update those counters to account for
+    // allocations or deallocations since the current peak.
+    struct UsageHistory
+    {
+        uint64_t last_known_peak{};
+        size_t allocations_contributed_to_last_known_peak{};
+        size_t bytes_contributed_to_last_known_peak{};
+        // NOTE: Signed, as we could have more deallocations than allocations
+        // since the last peak, or more bytes deallocated than allocated.
+        int64_t count_since_last_peak{};
+        int64_t bytes_since_last_peak{};
+    };
+
+    // Information about allocations and deallocations, aggregated by location.
+    using UsageHistoryByLocation =
+            std::unordered_map<HighWaterMarkLocationKey, UsageHistory, HighWaterMarkLocationKeyHash>;
+    UsageHistoryByLocation d_usage_history_by_location;
+
+    // Simple allocations contributing to the current heap size.
+    std::unordered_map<uintptr_t, Allocation> d_ptr_to_allocation;
+
+    // Ranged allocations contributing to the current heap size.
+    IntervalTree<Allocation> d_mmap_intervals;
+
+    UsageHistory& getUsageHistory(const Allocation& allocation);
+    void refreshUsageHistory(UsageHistory& history);
+    void recordPossiblePeak();
+    void recordUsageDelta(const Allocation& allocation, int64_t count_delta, int64_t bytes_delta);
+    reduced_snapshot_map_t getAllocations(bool merge_threads, bool stop_at_high_water_mark) const;
+};
+
 class AllocationStatsAggregator
 {
   public:

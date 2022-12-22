@@ -11,6 +11,14 @@ LocationKey::operator==(const LocationKey& rhs) const
            && thread_id == rhs.thread_id;
 }
 
+bool
+HighWaterMarkLocationKey::operator==(const HighWaterMarkLocationKey& rhs) const
+{
+    return thread_id == rhs.thread_id && python_frame_id == rhs.python_frame_id
+           && native_frame_id == rhs.native_frame_id
+           && native_segment_generation == rhs.native_segment_generation && allocator == rhs.allocator;
+}
+
 Interval::Interval(uintptr_t begin, uintptr_t end)
 : begin(begin)
 , end(end)
@@ -192,6 +200,176 @@ TemporaryAllocationsAggregator::getSnapshotAllocations(bool merge_threads)
     return stack_to_allocation;
 }
 
+HighWaterMarkAggregator::UsageHistory&
+HighWaterMarkAggregator::getUsageHistory(const Allocation& allocation)
+{
+    HighWaterMarkLocationKey loc_key{
+            allocation.tid,
+            allocation.frame_index,
+            allocation.native_frame_id,
+            allocation.native_segment_generation,
+            allocation.allocator};
+
+    auto existing_it = d_usage_history_by_location.find(loc_key);
+    if (existing_it != d_usage_history_by_location.end()) {
+        // Found an existing record. Update it to reflect the latest peak if
+        // it's out of date, then return it.
+        refreshUsageHistory(existing_it->second);
+        return existing_it->second;
+    }
+
+    // If it doesn't already exist, we'll create it.
+    // A deallocation should never reach this point.
+    assert(!hooks::isDeallocator(allocation.allocator));
+
+    UsageHistory to_insert{};
+    to_insert.last_known_peak = d_peak_count;
+    auto [new_it, inserted] = d_usage_history_by_location.insert(std::make_pair(loc_key, to_insert));
+    assert(inserted);
+    return new_it->second;
+}
+
+void
+HighWaterMarkAggregator::refreshUsageHistory(HighWaterMarkAggregator::UsageHistory& history)
+{
+    if (history.last_known_peak == d_peak_count) {
+        return;
+    }
+
+    // Any deltas since the last peak are part of the new one.
+    history.last_known_peak = d_peak_count;
+    history.allocations_contributed_to_last_known_peak += history.count_since_last_peak;
+    history.bytes_contributed_to_last_known_peak += history.bytes_since_last_peak;
+
+    history.count_since_last_peak = 0;
+    history.bytes_since_last_peak = 0;
+}
+
+void
+HighWaterMarkAggregator::recordPossiblePeak()
+{
+    if (d_current_heap_size < d_heap_size_at_last_peak) {
+        return;
+    }
+
+    // Found a new peak!
+    d_peak_count += 1;
+    d_heap_size_at_last_peak = d_current_heap_size;
+}
+
+void
+HighWaterMarkAggregator::recordUsageDelta(
+        const Allocation& allocation,
+        int64_t count_delta,
+        int64_t bytes_delta)
+{
+    if (bytes_delta < 0) {
+        // Update our stats if we're falling off a peak.
+        recordPossiblePeak();
+    }
+
+    d_current_heap_size += bytes_delta;
+
+    auto& history = getUsageHistory(allocation);
+    history.count_since_last_peak += count_delta;
+    history.bytes_since_last_peak += bytes_delta;
+}
+
+void
+HighWaterMarkAggregator::addAllocation(const Allocation& allocation)
+{
+    switch (hooks::allocatorKind(allocation.allocator)) {
+        case hooks::AllocatorKind::SIMPLE_ALLOCATOR: {
+            recordUsageDelta(allocation, 1, allocation.size);
+            d_ptr_to_allocation[allocation.address] = allocation;
+            break;
+        }
+        case hooks::AllocatorKind::SIMPLE_DEALLOCATOR: {
+            auto it = d_ptr_to_allocation.find(allocation.address);
+            if (it != d_ptr_to_allocation.end()) {
+                recordUsageDelta(it->second, -1, -static_cast<int64_t>(it->second.size));
+                d_ptr_to_allocation.erase(it);
+            }
+            break;
+        }
+        case hooks::AllocatorKind::RANGED_ALLOCATOR: {
+            d_mmap_intervals.addInterval(allocation.address, allocation.size, allocation);
+            recordUsageDelta(allocation, 1, allocation.size);
+            break;
+        }
+        case hooks::AllocatorKind::RANGED_DEALLOCATOR: {
+            auto removal_stats = d_mmap_intervals.removeInterval(allocation.address, allocation.size);
+            for (const auto& [interval, allocation] : removal_stats.freed_allocations) {
+                recordUsageDelta(allocation, -1, -static_cast<int64_t>(interval.size()));
+            }
+            for (const auto& [interval, allocation] : removal_stats.shrunk_allocations) {
+                recordUsageDelta(allocation, 0, -static_cast<int64_t>(interval.size()));
+            }
+            for (const auto& [interval, allocation] : removal_stats.split_allocations) {
+                recordUsageDelta(allocation, 1, -static_cast<int64_t>(interval.size()));
+            }
+            break;
+        }
+    }
+}
+
+size_t
+HighWaterMarkAggregator::getCurrentHeapSize() const noexcept
+{
+    return d_current_heap_size;
+}
+
+bool
+HighWaterMarkAggregator::visitAllocations(allocation_callback_t callback) const
+{
+    for (const auto& [loc, usage] : d_usage_history_by_location) {
+        size_t water_mark_allocations = 0;
+        size_t water_mark_bytes = 0;
+        size_t leaked_allocations = 0;
+        size_t leaked_bytes = 0;
+
+        if (usage.last_known_peak == d_peak_count) {
+            // The last known peak was the high water mark. The allocations
+            // and bytes contributed to the last known peak are in fact the
+            // amount contributed to the high water mark, and the amount
+            // contributed to the leaks is the delta against those values
+            // stored in the allocations and count since the last peak.
+            water_mark_allocations = usage.allocations_contributed_to_last_known_peak;
+            water_mark_bytes = usage.bytes_contributed_to_last_known_peak;
+
+            leaked_allocations = water_mark_allocations + usage.count_since_last_peak;
+            leaked_bytes = water_mark_bytes + usage.bytes_since_last_peak;
+        } else {
+            // Nothing was allocated or deallocated at this location since
+            // the true high water mark. Everything that we counted
+            // contributes to both the high water mark and the leaks.
+            water_mark_allocations =
+                    usage.allocations_contributed_to_last_known_peak + usage.count_since_last_peak;
+            water_mark_bytes = usage.bytes_contributed_to_last_known_peak + usage.bytes_since_last_peak;
+
+            leaked_allocations = water_mark_allocations;
+            leaked_bytes = water_mark_bytes;
+        }
+
+        AggregatedAllocation alloc{
+                loc.thread_id,
+                loc.allocator,
+                loc.native_frame_id,
+                loc.python_frame_id,
+                loc.native_segment_generation,
+                water_mark_allocations,
+                leaked_allocations,
+                water_mark_bytes,
+                leaked_bytes,
+        };
+
+        if (!callback(alloc)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 /**
  * Produce an aggregated snapshot from a vector of allocations and a index in that vector
  *
@@ -242,6 +420,7 @@ HighWatermarkFinder::processAllocation(const Allocation& allocation)
                 d_current_memory -= it->second;
                 d_ptr_to_allocation_size.erase(it);
             }
+            updatePeak(index);
             break;
         }
         case hooks::AllocatorKind::RANGED_ALLOCATOR: {
