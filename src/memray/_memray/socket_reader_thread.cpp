@@ -20,17 +20,22 @@ BackgroundSocketReader::backgroundThreadWorker()
             case RecordResult::ALLOCATION_RECORD: {
                 std::lock_guard<std::mutex> lock(d_mutex);
                 d_aggregator.addAllocation(d_record_reader->getLatestAllocation());
-                break;
-            }
+            } break;
 
             case RecordResult::MEMORY_RECORD: {
-                break;
-            }
+            } break;
+
+            case RecordResult::AGGREGATED_ALLOCATION_RECORD:
+            case RecordResult::MEMORY_SNAPSHOT: {
+                // This should never happen. These records come only from
+                // pre-aggregated files, and should never come from a socket.
+                abort();
+            } break;
+
             case RecordResult::END_OF_FILE:
             case RecordResult::ERROR: {
                 d_stop_thread = true;
-                return;
-            }
+            } break;
         }
     }
 }
