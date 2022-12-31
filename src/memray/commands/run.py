@@ -10,11 +10,14 @@ import sys
 import textwrap
 from contextlib import closing
 from contextlib import suppress
+from typing import Any
+from typing import Dict
 from typing import List
 from typing import Optional
 
 from memray import Destination
 from memray import FileDestination
+from memray import FileFormat
 from memray import SocketDestination
 from memray import Tracker
 from memray._errors import MemrayCommandError
@@ -34,13 +37,16 @@ def _run_tracker(
     post_run_message: Optional[str] = None,
     follow_fork: bool = False,
     trace_python_allocators: bool = False,
+    aggregate: bool = False,
 ) -> None:
     try:
-        kwargs = {}
+        kwargs: Dict[str, Any] = {}
         if follow_fork:
             kwargs["follow_fork"] = True
         if trace_python_allocators:
             kwargs["trace_python_allocators"] = True
+        if aggregate:
+            kwargs["file_format"] = FileFormat.AGGREGATED_ALLOCATIONS
         tracker = Tracker(destination=destination, native_traces=args.native, **kwargs)
     except OSError as error:
         raise MemrayCommandError(str(error), exit_code=1)
@@ -170,6 +176,7 @@ def _run_with_file_output(args: argparse.Namespace) -> None:
             post_run_message=example_report_generation_message,
             follow_fork=args.follow_fork,
             trace_python_allocators=args.trace_python_allocators,
+            aggregate=args.aggregate,
         )
     except OSError as error:
         raise MemrayCommandError(str(error), exit_code=1)
@@ -206,6 +213,12 @@ class RunCommand:
             help="Port to use when starting live tracking (default: random free port)",
             default=None,
             type=int,
+        )
+        parser.add_argument(
+            "--aggregate",
+            help="Write aggregated stats to the output file instead of all allocations",
+            action="store_true",
+            default=False,
         )
 
         parser.add_argument(
@@ -298,6 +311,8 @@ class RunCommand:
             parser.error("The --live-port argument requires --live-remote")
         if args.follow_fork is True and (args.live_mode or args.live_remote_mode):
             parser.error("--follow-fork cannot be used with the live TUI")
+        if args.aggregate and (args.live_mode or args.live_remote_mode):
+            parser.error("--aggregate cannot be used with the live TUI")
         with contextlib.suppress(OSError):
             if args.run_as_cmd and pathlib.Path(args.script).exists():
                 parser.error("remove the option -c to run a file")
