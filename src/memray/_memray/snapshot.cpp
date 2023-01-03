@@ -207,7 +207,9 @@ AggregatedCaptureReaggregator::addAllocation(const Allocation& allocation)
     assert(!hooks::isDeallocator(allocation.allocator));
     assert(0 == allocation.address);
 
-    d_allocations.push_back(allocation);
+    if (allocation.n_allocations != 0) {
+        d_allocations.push_back(allocation);
+    }
 }
 
 reduced_snapshot_map_t
