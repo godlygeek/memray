@@ -355,13 +355,19 @@ HighWaterMarkAggregator::getCurrentHeapSize() const noexcept
 bool
 HighWaterMarkAggregator::visitAllocations(allocation_callback_t callback) const
 {
+    uint64_t final_peak_count = d_peak_count;
+    if (d_current_heap_size >= d_heap_size_at_last_peak) {
+        // We're currently at a new peak that we haven't yet fallen from.
+        final_peak_count++;
+    }
+
     for (const auto& [loc, usage] : d_usage_history_by_location) {
         size_t water_mark_allocations = 0;
         size_t water_mark_bytes = 0;
         size_t leaked_allocations = 0;
         size_t leaked_bytes = 0;
 
-        if (usage.last_known_peak == d_peak_count) {
+        if (usage.last_known_peak == final_peak_count) {
             // The last known peak was the high water mark. The allocations
             // and bytes contributed to the last known peak are in fact the
             // amount contributed to the high water mark, and the amount
