@@ -7,10 +7,12 @@
 #include <memory>
 #include <mutex>
 #include <stdexcept>
+#include <thread>
 
 #include "frame_tree.h"
 #include "records.h"
 #include "snapshot.h"
+#include "tracking_api.h"
 
 namespace memray::tracking_api {
 
@@ -128,8 +130,38 @@ class AggregatingRecordWriter : public RecordWriter
     using python_stack_ids_t = std::vector<FrameTree::index_t>;
     using python_stack_ids_by_tid = std::unordered_map<thread_id_t, python_stack_ids_t>;
 
+    class BackgroundThread
+    {
+      public:
+        // Constructors
+        BackgroundThread(
+                std::mutex& mutex,
+                std::vector<Allocation>& allocations,
+                std::condition_variable& cv);
+
+        // Methods
+        void start();
+        void stop();
+
+        using allocation_callback_t = std::function<bool(const AggregatedAllocation&)>;
+        bool visitAllocations(allocation_callback_t callback) const;
+
+      private:
+        // Data members
+        std::mutex& d_mutex;
+        std::vector<Allocation>& d_allocations;
+        std::condition_variable& d_cv;
+        bool d_stop{false};
+        std::thread d_thread;
+        api::HighWaterMarkAggregator d_high_water_mark_aggregator;
+    };
+
     // Data members
     std::mutex d_mutex;
+    std::vector<Allocation> d_allocation_queue;
+    std::condition_variable d_cv;
+    std::unique_ptr<BackgroundThread> d_background_thread;
+
     HeaderRecord d_header;
     TrackerStats d_stats;
     pyframe_map_t d_frames_by_id;
@@ -139,7 +171,6 @@ class AggregatingRecordWriter : public RecordWriter
     std::unordered_map<thread_id_t, std::string> d_thread_name_by_tid;
     FrameTree d_python_frame_tree;
     python_stack_ids_by_tid d_python_stack_ids_by_thread;
-    api::HighWaterMarkAggregator d_high_water_mark_aggregator;
 };
 
 std::unique_ptr<RecordWriter>
@@ -248,7 +279,8 @@ RecordWriter::writeMappingsCommon(const std::vector<ImageSegments>& mappings)
 
         for (const auto& segment : image.segments) {
             if (!writeSimpleType(segment_token) || !writeSimpleType(segment.vaddr)
-                || !writeVarint(segment.memsz)) {
+                || !writeVarint(segment.memsz))
+            {
                 return false;
             }
         }
@@ -420,6 +452,9 @@ AggregatingRecordWriter::AggregatingRecordWriter(
     d_header.python_allocator = getPythonAllocator();
 
     d_stats.start_time = duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
+
+    d_background_thread = std::make_unique<BackgroundThread>(d_mutex, d_allocation_queue, d_cv);
+    d_background_thread->start();
 }
 
 void
@@ -442,6 +477,8 @@ AggregatingRecordWriter::writeHeader(bool seek_to_start)
 bool
 AggregatingRecordWriter::writeTrailer()
 {
+    d_background_thread->stop();
+
     std::lock_guard<std::mutex> lock(d_mutex);
 
     d_stats.end_time = duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
@@ -505,7 +542,7 @@ AggregatingRecordWriter::writeTrailer()
         }
     }
 
-    d_high_water_mark_aggregator.visitAllocations([&](const AggregatedAllocation& allocation) {
+    d_background_thread->visitAllocations([&](const AggregatedAllocation& allocation) {
         if (allocation.n_allocations_in_high_water_mark == 0 && allocation.n_allocations_leaked == 0) {
             return true;
         }
@@ -543,7 +580,7 @@ AggregatingRecordWriter::writeRecord(const MemoryRecord& record)
     MemorySnapshot snapshot;
     snapshot.ms_since_epoch = record.ms_since_epoch;
     snapshot.rss = record.rss;
-    snapshot.heap = d_high_water_mark_aggregator.getCurrentHeapSize();
+    snapshot.heap = 0;  // FIXME
     d_memory_snapshots.push_back(snapshot);
     return true;
 }
@@ -624,7 +661,8 @@ AggregatingRecordWriter::writeThreadSpecificRecord(thread_id_t tid, const Alloca
     }
     allocation.native_segment_generation = 0;
     allocation.n_allocations = 1;
-    d_high_water_mark_aggregator.addAllocation(allocation);
+    d_allocation_queue.push_back(allocation);
+    d_cv.notify_one();
     return true;
 }
 
@@ -642,7 +680,8 @@ AggregatingRecordWriter::writeThreadSpecificRecord(thread_id_t tid, const Native
     allocation.frame_index = stack.empty() ? 0 : stack.back();
     allocation.native_segment_generation = d_mappings_by_generation.size();
     allocation.n_allocations = 1;
-    d_high_water_mark_aggregator.addAllocation(allocation);
+    d_allocation_queue.push_back(allocation);
+    d_cv.notify_one();
     return true;
 }
 
@@ -652,6 +691,70 @@ AggregatingRecordWriter::writeThreadSpecificRecord(thread_id_t tid, const Thread
     std::lock_guard<std::mutex> lock(d_mutex);
     d_thread_name_by_tid[tid] = record.name;
     return true;
+}
+
+AggregatingRecordWriter::BackgroundThread::BackgroundThread(
+        std::mutex& mutex,
+        std::vector<Allocation>& allocations,
+        std::condition_variable& cv)
+: d_mutex(mutex)
+, d_allocations(allocations)
+, d_cv(cv)
+{
+}
+
+void
+AggregatingRecordWriter::BackgroundThread::start()
+{
+    assert(d_thread.get_id() == std::thread::id());
+    d_thread = std::thread([&]() {
+        RecursionGuard::isActive = true;
+        std::vector<Allocation> working_set;
+        bool finished = false;
+        while (!finished) {
+            {
+                std::unique_lock<std::mutex> lock(d_mutex);
+                d_cv.wait(lock);
+                d_allocations.swap(working_set);
+                if (d_stop) {
+                    finished = true;
+                }
+            }
+
+            for (const auto& alloc : working_set) {
+                d_high_water_mark_aggregator.addAllocation(alloc);
+            }
+
+            working_set.clear();
+        }
+    });
+}
+
+void
+AggregatingRecordWriter::BackgroundThread::stop()
+{
+    if (d_stop) {
+        return;
+    }
+
+    {
+        std::unique_lock<std::mutex> lock(d_mutex);
+        d_stop = true;
+        d_cv.notify_one();
+    }
+    if (d_thread.joinable()) {
+        try {
+            d_thread.join();
+        } catch (const std::system_error&) {
+        }
+    }
+}
+
+bool
+AggregatingRecordWriter::BackgroundThread::visitAllocations(allocation_callback_t callback) const
+{
+    assert(d_stop);
+    return d_high_water_mark_aggregator.visitAllocations(callback);
 }
 
 }  // namespace memray::tracking_api
