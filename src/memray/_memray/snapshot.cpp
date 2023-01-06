@@ -308,6 +308,14 @@ HighWaterMarkAggregator::recordUsageDelta(
     history.bytes_since_last_peak += bytes_delta;
 }
 
+HighWaterMarkAggregator::HighWaterMarkAggregator()
+{
+    d_ptr_to_allocation.set_empty_key(1);
+    d_ptr_to_allocation.set_deleted_key(2);
+    d_ptr_to_allocation.min_load_factor(0.0);
+    d_usage_history_by_location.set_empty_key({});
+}
+
 void
 HighWaterMarkAggregator::addAllocation(const Allocation& allocation)
 {

@@ -3,11 +3,14 @@
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
 
+#include <cstddef>
 #include <deque>
 #include <functional>
 #include <optional>
 #include <unordered_map>
 #include <vector>
+
+#include <sparsehash/dense_hash_map>
 
 #include "frame_tree.h"
 #include "records.h"
@@ -264,9 +267,20 @@ struct HighWaterMarkLocationKeyHash
     }
 };
 
+struct AlignedPointerHash
+{
+    size_t operator()(uintptr_t ptr) const
+    {
+        static_assert(alignof(std::max_align_t) == 16);
+        return reinterpret_cast<size_t>(ptr) >> 3;
+    }
+};
+
 class HighWaterMarkAggregator
 {
   public:
+    HighWaterMarkAggregator();
+
     void addAllocation(const Allocation& allocation);
     size_t getCurrentHeapSize() const noexcept;
 
@@ -300,12 +314,12 @@ class HighWaterMarkAggregator
     };
 
     // Information about allocations and deallocations, aggregated by location.
-    using UsageHistoryByLocation =
-            std::unordered_map<HighWaterMarkLocationKey, UsageHistory, HighWaterMarkLocationKeyHash>;
+    using UsageHistoryByLocation = google::
+            dense_hash_map<HighWaterMarkLocationKey, UsageHistory, HighWaterMarkLocationKeyHash>;
     UsageHistoryByLocation d_usage_history_by_location;
 
     // Simple allocations contributing to the current heap size.
-    std::unordered_map<uintptr_t, Allocation> d_ptr_to_allocation;
+    google::dense_hash_map<uintptr_t, Allocation, AlignedPointerHash> d_ptr_to_allocation;
 
     // Ranged allocations contributing to the current heap size.
     IntervalTree<Allocation> d_mmap_intervals;

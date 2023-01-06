@@ -233,7 +233,7 @@ MEMRAY_EXTENSION = Extension(
         "lz4",
     ],
     library_dirs=[str(LIBBACKTRACE_LIBDIR)],
-    include_dirs=["src", str(LIBBACKTRACE_INCLUDEDIRS)],
+    include_dirs=["src", str(LIBBACKTRACE_INCLUDEDIRS), "src/vendor/sparsehash"],
     language="c++",
     extra_compile_args=["-std=c++17", "-Wall", *EXTRA_COMPILE_ARGS],
     extra_link_args=["-std=c++17", "-lbacktrace", *EXTRA_LINK_ARGS],
