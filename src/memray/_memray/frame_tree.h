@@ -3,6 +3,8 @@
 #include <mutex>
 #include <vector>
 
+#include <boost/container/small_vector.hpp>
+
 #include "records.h"
 
 namespace memray::tracking_api {
@@ -60,6 +62,7 @@ class FrameTree
                 return 0;
             }
             d_graph.push_back({frame, parent_index});
+            return new_index;
         }
         return it->child_index;
     }
@@ -79,9 +82,9 @@ class FrameTree
     {
         frame_id_t frame_id;
         index_t parent_index;
-        std::vector<DescendentEdge> children;
+        boost::container::small_vector<DescendentEdge, 20> children;
     };
     mutable std::mutex d_mutex;
-    std::vector<Node> d_graph{{0, 0, {}}};
+    std::vector<Node> d_graph{{0, 0}};
 };
 }  // namespace memray::tracking_api
