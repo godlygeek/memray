@@ -49,7 +49,10 @@ class StreamingRecordWriter : public RecordWriter
     explicit StreamingRecordWriter(
             std::unique_ptr<memray::io::Sink> sink,
             const std::string& command_line,
-            bool native_traces);
+            bool native_traces,
+            memray::tracking_api::millis_t start_time = 0,
+            memray::tracking_api::millis_t end_time = 0,
+            pid_t pid = -1);
 
     StreamingRecordWriter(StreamingRecordWriter& other) = delete;
     StreamingRecordWriter(StreamingRecordWriter&& other) = delete;
@@ -78,6 +81,7 @@ class StreamingRecordWriter : public RecordWriter
     bool maybeWriteContextSwitchRecordUnsafe(thread_id_t tid);
 
     // Data members
+    bool d_end_time_provided;
     int d_version{CURRENT_HEADER_VERSION};
     HeaderRecord d_header{};
     TrackerStats d_stats{};
@@ -90,7 +94,10 @@ class AggregatingRecordWriter : public RecordWriter
     explicit AggregatingRecordWriter(
             std::unique_ptr<memray::io::Sink> sink,
             const std::string& command_line,
-            bool native_traces);
+            bool native_traces,
+            memray::tracking_api::millis_t start_time = 0,
+            memray::tracking_api::millis_t end_time = 0,
+            pid_t pid = -1);
 
     AggregatingRecordWriter(StreamingRecordWriter& other) = delete;
     AggregatingRecordWriter(StreamingRecordWriter&& other) = delete;
@@ -138,16 +145,28 @@ createRecordWriter(
         std::unique_ptr<memray::io::Sink> sink,
         const std::string& command_line,
         bool native_traces,
-        FileFormat file_format)
+        FileFormat file_format,
+        memray::tracking_api::millis_t start_time,
+        memray::tracking_api::millis_t end_time,
+        pid_t pid)
 {
     switch (file_format) {
         case FileFormat::ALL_ALLOCATIONS:
-            return std::make_unique<StreamingRecordWriter>(std::move(sink), command_line, native_traces);
+            return std::make_unique<StreamingRecordWriter>(
+                    std::move(sink),
+                    command_line,
+                    native_traces,
+                    start_time,
+                    end_time,
+                    pid);
         case FileFormat::AGGREGATED_ALLOCATIONS:
             return std::make_unique<AggregatingRecordWriter>(
                     std::move(sink),
                     command_line,
-                    native_traces);
+                    native_traces,
+                    start_time,
+                    end_time,
+                    pid);
         default:
             throw std::runtime_error("Invalid file format enumerator");
     }
@@ -156,9 +175,18 @@ createRecordWriter(
 StreamingRecordWriter::StreamingRecordWriter(
         std::unique_ptr<memray::io::Sink> sink,
         const std::string& command_line,
-        bool native_traces)
+        bool native_traces,
+        memray::tracking_api::millis_t start_time,
+        memray::tracking_api::millis_t end_time,
+        pid_t pid)
 : RecordWriter(std::move(sink))
-, d_stats({0, 0, duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count()})
+, d_end_time_provided(end_time != 0)
+, d_stats(
+          {0,
+           0,
+           start_time ? start_time
+                      : duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count(),
+           end_time ? end_time : 0})
 {
     d_header = HeaderRecord{
             "",
@@ -167,7 +195,7 @@ StreamingRecordWriter::StreamingRecordWriter(
             FileFormat::ALL_ALLOCATIONS,
             d_stats,
             command_line,
-            ::getpid(),
+            pid != -1 ? pid : ::getpid(),
             0,
             0,
             getPythonAllocator()};
@@ -343,7 +371,9 @@ StreamingRecordWriter::writeHeader(bool seek_to_start)
         }
     }
 
-    d_stats.end_time = duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
+    if (!d_end_time_provided) {
+        d_stats.end_time = duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
+    }
     d_header.stats = d_stats;
     return writeHeaderCommon(d_header);
 }
@@ -388,7 +418,10 @@ StreamingRecordWriter::cloneInChildProcess()
 AggregatingRecordWriter::AggregatingRecordWriter(
         std::unique_ptr<memray::io::Sink> sink,
         const std::string& command_line,
-        bool native_traces)
+        bool native_traces,
+        memray::tracking_api::millis_t start_time,
+        memray::tracking_api::millis_t end_time,
+        pid_t pid)
 : RecordWriter(std::move(sink))
 {
     memcpy(d_header.magic, MAGIC, sizeof(d_header.magic));
@@ -396,10 +429,16 @@ AggregatingRecordWriter::AggregatingRecordWriter(
     d_header.native_traces = native_traces;
     d_header.file_format = FileFormat::AGGREGATED_ALLOCATIONS;
     d_header.command_line = command_line;
-    d_header.pid = ::getpid();
+    d_header.pid = pid != -1 ? pid : ::getpid();
     d_header.python_allocator = getPythonAllocator();
 
-    d_stats.start_time = duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
+    if (start_time) {
+        d_stats.start_time = start_time;
+    } else {
+        d_stats.start_time = duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
+    }
+
+    d_stats.end_time = end_time;
 }
 
 void
@@ -422,7 +461,9 @@ AggregatingRecordWriter::writeHeader(bool seek_to_start)
 bool
 AggregatingRecordWriter::writeTrailer()
 {
-    d_stats.end_time = duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
+    if (!d_stats.end_time) {
+        d_stats.end_time = duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
+    }
     d_header.stats = d_stats;
     if (!writeHeaderCommon(d_header)) {
         return false;

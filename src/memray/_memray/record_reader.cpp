@@ -11,7 +11,9 @@
 #include "hooks.h"
 #include "logging.h"
 #include "record_reader.h"
+#include "record_writer.h"
 #include "records.h"
+#include "sink.h"
 #include "source.h"
 
 namespace memray::api {
@@ -729,6 +731,214 @@ RecordReader::nextRecordFromAggregatedAllocationsFile()
             default: {
                 if (d_input->is_open()) LOG(ERROR) << "Invalid record type";
                 return RecordResult::ERROR;
+            } break;
+        }
+    }
+}
+
+PyObject*
+RecordReader::convertToAggregatedAllocationsFormat(
+        const std::string& file_name,
+        bool overwrite,
+        bool compress)
+{
+    if (d_header.file_format != FileFormat::ALL_ALLOCATIONS) {
+        PyErr_SetString(PyExc_RuntimeError, "Input file is not in ALL_ALLOCATIONS format");
+        return nullptr;
+    }
+
+    std::unique_ptr<memray::tracking_api::RecordWriter> writer = createRecordWriter(
+            std::make_unique<memray::io::FileSink>(file_name, overwrite, compress),
+            d_header.command_line,
+            d_header.native_traces,
+            FileFormat::AGGREGATED_ALLOCATIONS);
+
+    thread_id_t tid{};
+    std::optional<std::vector<ImageSegments>> mappings;
+    std::optional<ImageSegments> current_mapping;
+    while (true) {
+        if (0 != PyErr_CheckSignals()) {
+            return nullptr;
+        }
+
+        RecordTypeAndFlags record_type_and_flags;
+        if (!d_input->read(
+                    reinterpret_cast<char*>(&record_type_and_flags),
+                    sizeof(record_type_and_flags)))
+        {
+            writer->writeTrailer();
+            Py_RETURN_NONE;
+        }
+
+        bool is_segment_header = record_type_and_flags.record_type == RecordType::SEGMENT_HEADER;
+        bool is_segment = record_type_and_flags.record_type == RecordType::SEGMENT;
+
+        if (current_mapping && !is_segment) {
+            mappings.value().push_back(std::move(current_mapping.value()));
+            current_mapping.reset();
+        }
+
+        if (mappings && !is_segment && !is_segment_header) {
+            writer->writeMappings(mappings.value());
+            mappings.reset();
+        }
+
+        switch (record_type_and_flags.record_type) {
+            case RecordType::OTHER: {
+                switch (static_cast<OtherRecordType>(record_type_and_flags.flags)) {
+                    case OtherRecordType::TRAILER: {
+                        // Treat as EOF
+                        writer->writeTrailer();
+                        Py_RETURN_NONE;
+                    } break;
+                    default: {
+                        if (d_input->is_open()) LOG(ERROR) << "Invalid record subtype";
+                        Py_RETURN_NONE;
+                    } break;
+                }
+            } break;
+            case RecordType::ALLOCATION_WITH_NATIVE: {
+                NativeAllocationRecord record;
+                if (!parseNativeAllocationRecord(&record, record_type_and_flags.flags)) {
+                    if (d_input->is_open()) LOG(ERROR) << "Failed to parse record";
+                    Py_RETURN_NONE;
+                }
+                if (!writer->writeThreadSpecificRecord(tid, record)) {
+                    if (d_input->is_open()) LOG(ERROR) << "Failed to process record";
+                    Py_RETURN_NONE;
+                }
+            } break;
+            case RecordType::ALLOCATION: {
+                AllocationRecord record;
+                if (!parseAllocationRecord(&record, record_type_and_flags.flags)) {
+                    if (d_input->is_open()) LOG(ERROR) << "Failed to parse record";
+                    Py_RETURN_NONE;
+                }
+                if (!writer->writeThreadSpecificRecord(tid, record)) {
+                    if (d_input->is_open()) LOG(ERROR) << "Failed to process record";
+                    Py_RETURN_NONE;
+                }
+            } break;
+            case RecordType::FRAME_PUSH: {
+                FramePush record;
+                if (!parseFramePush(&record)) {
+                    if (d_input->is_open()) LOG(ERROR) << "Failed to parse record";
+                    Py_RETURN_NONE;
+                }
+                if (!writer->writeThreadSpecificRecord(tid, record)) {
+                    if (d_input->is_open()) LOG(ERROR) << "Failed to process record";
+                    Py_RETURN_NONE;
+                }
+            } break;
+            case RecordType::FRAME_POP: {
+                FramePop record;
+                if (!parseFramePop(&record, record_type_and_flags.flags)) {
+                    if (d_input->is_open()) LOG(ERROR) << "Failed to parse record";
+                    Py_RETURN_NONE;
+                }
+                if (!writer->writeThreadSpecificRecord(tid, record)) {
+                    if (d_input->is_open()) LOG(ERROR) << "Failed to process record";
+                    Py_RETURN_NONE;
+                }
+            } break;
+            case RecordType::FRAME_INDEX: {
+                tracking_api::pyframe_map_val_t record;
+                if (!parseFrameIndex(&record, record_type_and_flags.flags)) {
+                    if (d_input->is_open()) LOG(ERROR) << "Failed to parse record";
+                    Py_RETURN_NONE;
+                }
+                pyrawframe_map_val_t raw_record{
+                        record.first,
+                        RawFrame{
+                                record.second.function_name.c_str(),
+                                record.second.filename.c_str(),
+                                record.second.lineno,
+                                record.second.is_entry_frame}};
+                if (!writer->writeRecord(raw_record)) {
+                    if (d_input->is_open()) LOG(ERROR) << "Failed to process record";
+                    Py_RETURN_NONE;
+                }
+            } break;
+            case RecordType::NATIVE_TRACE_INDEX: {
+                UnresolvedNativeFrame record;
+                if (!parseNativeFrameIndex(&record)) {
+                    if (d_input->is_open()) LOG(ERROR) << "Failed to parse record";
+                    Py_RETURN_NONE;
+                }
+                if (!writer->writeRecord(record)) {
+                    if (d_input->is_open()) LOG(ERROR) << "Failed to process record";
+                    Py_RETURN_NONE;
+                }
+            } break;
+            case RecordType::MEMORY_MAP_START: {
+                if (!parseMemoryMapStart()) {
+                    if (d_input->is_open()) LOG(ERROR) << "Failed to parse record";
+                    Py_RETURN_NONE;
+                }
+                mappings.emplace();
+            } break;
+            case RecordType::SEGMENT_HEADER: {
+                if (!mappings) {
+                    // SEGMENT_HEADER not following MEMORY_MAP_START
+                    if (d_input->is_open()) LOG(ERROR) << "Failed to parse record";
+                    Py_RETURN_NONE;
+                }
+
+                std::string filename;
+                size_t num_segments;
+                uintptr_t addr;
+                if (!parseSegmentHeader(&filename, &num_segments, &addr)) {
+                    if (d_input->is_open()) LOG(ERROR) << "Failed to parse record";
+                    Py_RETURN_NONE;
+                }
+                current_mapping.emplace(ImageSegments{filename, addr});
+                current_mapping.value().segments.resize(num_segments);
+            } break;
+            case RecordType::SEGMENT: {
+                if (!current_mapping) {
+                    // SEGMENT not following SEGMENT_HEADER
+                    if (d_input->is_open()) LOG(ERROR) << "Failed to parse record";
+                    Py_RETURN_NONE;
+                }
+
+                Segment record;
+                if (!parseSegment(&record)) {
+                    if (d_input->is_open()) LOG(ERROR) << "Failed to parse record";
+                    Py_RETURN_NONE;
+                }
+                current_mapping.value().segments.push_back(record);
+            } break;
+            case RecordType::THREAD_RECORD: {
+                std::string name;
+                if (!parseThreadRecord(&name)) {
+                    if (d_input->is_open()) LOG(ERROR) << "Failed to parse record";
+                    Py_RETURN_NONE;
+                }
+                if (!writer->writeThreadSpecificRecord(tid, ThreadRecord{name.c_str()})) {
+                    if (d_input->is_open()) LOG(ERROR) << "Failed to process record";
+                    Py_RETURN_NONE;
+                }
+            } break;
+            case RecordType::MEMORY_RECORD: {
+                MemoryRecord record;
+                if (!parseMemoryRecord(&record)) {
+                    if (d_input->is_open()) LOG(ERROR) << "Failed to parse record";
+                    Py_RETURN_NONE;
+                }
+                if (!writer->writeRecord(record)) {
+                    if (d_input->is_open()) LOG(ERROR) << "Failed to process record";
+                    Py_RETURN_NONE;
+                }
+            } break;
+            case RecordType::CONTEXT_SWITCH: {
+                if (!parseContextSwitch(&tid)) {
+                    if (d_input->is_open()) LOG(ERROR) << "Failed to parse record";
+                    Py_RETURN_NONE;
+                }
+            } break;
+            default: {
+                if (d_input->is_open()) LOG(ERROR) << "Failed to parse record";
+                Py_RETURN_NONE;
             } break;
         }
     }

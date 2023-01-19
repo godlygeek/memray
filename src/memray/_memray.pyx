@@ -936,6 +936,20 @@ def dump_all_records(object file_name):
     _reader.get().dumpAllRecords()
 
 
+def convert_to_aggregated(object file_name, bool overwrite=False, bool compress=True):
+    cdef str path = str(file_name)
+    if not pathlib.Path(path).exists():
+        raise IOError(f"No such file: {path}")
+
+    cdef shared_ptr[RecordReader] _reader = make_shared[RecordReader](
+            unique_ptr[FileSource](new FileSource(path)))
+    _reader.get().convertToAggregatedAllocationsFormat(
+        path + ".aggregated",
+        overwrite,
+        compress,
+    )
+
+
 cdef class SocketReader:
     cdef BackgroundSocketReader* _impl
     cdef shared_ptr[RecordReader] _reader

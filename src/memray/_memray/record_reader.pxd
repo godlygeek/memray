@@ -42,6 +42,7 @@ cdef extern from "record_reader.h" namespace "memray::api":
         size_t getMainThreadTid()
         size_t getSkippedFramesOnMainThread()
         object dumpAllRecords() except+
+        object convertToAggregatedAllocationsFormat(string file_name, bool overwrite, bool compress) except+
         string getThreadName(long int tid) except+
         Allocation getLatestAllocation()
         MemoryRecord getLatestMemoryRecord()

@@ -62,7 +62,10 @@ createRecordWriter(
         std::unique_ptr<memray::io::Sink> sink,
         const std::string& command_line,
         bool native_traces,
-        FileFormat file_format);
+        FileFormat file_format,
+        memray::tracking_api::millis_t start_time = 0,
+        memray::tracking_api::millis_t end_time = 0,
+        pid_t pid = -1);
 
 template<typename T>
 bool inline RecordWriter::writeSimpleType(const T& item)
