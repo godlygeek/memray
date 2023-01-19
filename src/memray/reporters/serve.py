@@ -115,7 +115,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             metadata=self.reader.metadata,
             show_memory_leaks=False,
             merge_threads=True,
-            update_url="http://127.0.0.1:8000/time",
+            update_url="/time",
         )
 
     def _get_time(self, data):
