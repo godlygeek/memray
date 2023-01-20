@@ -19,6 +19,14 @@ HighWaterMarkLocationKey::operator==(const HighWaterMarkLocationKey& rhs) const
            && native_segment_generation == rhs.native_segment_generation && allocator == rhs.allocator;
 }
 
+bool
+operator<(const AllocationLifetime& lhs, const AllocationLifetime& rhs)
+{
+    return lhs.allocatedBeforeSnapshot != rhs.allocatedBeforeSnapshot
+                   ? lhs.allocatedBeforeSnapshot < rhs.allocatedBeforeSnapshot
+                   : lhs.deallocatedBeforeSnapshot < rhs.deallocatedBeforeSnapshot;
+}
+
 Interval::Interval(uintptr_t begin, uintptr_t end)
 : begin(begin)
 , end(end)
@@ -421,7 +429,7 @@ HighWaterMarkAggregator::visitAllocations(const allocation_callback_t& callback)
 }
 
 void
-MultiSnapshotAggregator::addAllocation(const Allocation& allocation_or_deallocation)
+AllocationLifetimeAggregator::addAllocation(const Allocation& allocation_or_deallocation)
 {
     // Note: Deallocation records don't tell us where the memory was allocated,
     //       so we need to save the records for allocations and cross-reference
@@ -430,13 +438,12 @@ MultiSnapshotAggregator::addAllocation(const Allocation& allocation_or_deallocat
         case hooks::AllocatorKind::SIMPLE_ALLOCATOR: {
             const Allocation& allocation = allocation_or_deallocation;
             size_t generation = d_num_snapshots;
-            recordAllocation(extractKey(allocation), 1, allocation.size);
             d_ptr_to_allocation[allocation.address] = {allocation, generation};
             break;
         }
         case hooks::AllocatorKind::SIMPLE_DEALLOCATOR: {
             const Allocation& deallocation = allocation_or_deallocation;
-            auto it = d_ptr_to_allocation.find(deallocation.address);
+            const auto it = d_ptr_to_allocation.find(deallocation.address);
             if (it != d_ptr_to_allocation.end()) {
                 const auto& [allocation, generation] = it->second;
                 recordDeallocation(extractKey(allocation), 1, allocation.size, generation);
@@ -447,8 +454,10 @@ MultiSnapshotAggregator::addAllocation(const Allocation& allocation_or_deallocat
         case hooks::AllocatorKind::RANGED_ALLOCATOR: {
             const Allocation& allocation = allocation_or_deallocation;
             size_t generation = d_num_snapshots;
-            recordAllocation(extractKey(allocation), 1, allocation.size);
-            d_mmap_intervals.addInterval(allocation.address, allocation.size, {allocation, generation});
+            d_mmap_intervals.addInterval(
+                    allocation.address,
+                    allocation.size,
+                    {std::make_shared<Allocation>(allocation), generation});
             break;
         }
         case hooks::AllocatorKind::RANGED_DEALLOCATOR: {
@@ -456,16 +465,13 @@ MultiSnapshotAggregator::addAllocation(const Allocation& allocation_or_deallocat
             auto removal_stats =
                     d_mmap_intervals.removeInterval(deallocation.address, deallocation.size);
             for (const auto& [interval, pair] : removal_stats.freed_allocations) {
-                const auto& [allocation, generation_allocated] = pair;
-                recordDeallocation(extractKey(allocation), 1, interval.size(), generation_allocated);
+                recordRangedDeallocation(pair.first, interval.size(), pair.second);
             }
             for (const auto& [interval, pair] : removal_stats.shrunk_allocations) {
-                const auto& [allocation, generation_allocated] = pair;
-                recordDeallocation(extractKey(allocation), 0, interval.size(), generation_allocated);
+                recordRangedDeallocation(pair.first, interval.size(), pair.second);
             }
             for (const auto& [interval, pair] : removal_stats.split_allocations) {
-                const auto& [allocation, generation_allocated] = pair;
-                recordDeallocation(extractKey(allocation), -1, interval.size(), generation_allocated);
+                recordRangedDeallocation(pair.first, interval.size(), pair.second);
             }
             break;
         }
@@ -473,7 +479,7 @@ MultiSnapshotAggregator::addAllocation(const Allocation& allocation_or_deallocat
 }
 
 HighWaterMarkLocationKey
-MultiSnapshotAggregator::extractKey(const Allocation& allocation)
+AllocationLifetimeAggregator::extractKey(const Allocation& allocation)
 {
     return {allocation.tid,
             allocation.frame_index,
@@ -483,61 +489,124 @@ MultiSnapshotAggregator::extractKey(const Allocation& allocation)
 }
 
 void
-MultiSnapshotAggregator::recordAllocation(
-        const HighWaterMarkLocationKey& key,
-        size_t count_delta,
-        size_t bytes_delta)
+AllocationLifetimeAggregator::recordRangedDeallocation(
+        const std::shared_ptr<Allocation>& allocation_ptr,
+        size_t bytes_deallocated,
+        size_t generation_allocated)
 {
-    auto& contribution = d_allocation_history[key][d_num_snapshots].allocations_since_last_snapshot;
-    contribution.num_allocations += count_delta;
-    contribution.num_bytes += bytes_delta;
+    bool fully_deallocated = allocation_ptr.use_count() == 1;
+    recordDeallocation(
+            extractKey(*allocation_ptr),
+            bytes_deallocated,
+            (fully_deallocated ? 1 : 0),
+            generation_allocated);
 }
 
 void
-MultiSnapshotAggregator::recordDeallocation(
+AllocationLifetimeAggregator::recordDeallocation(
         const HighWaterMarkLocationKey& key,
         size_t count_delta,
         size_t bytes_delta,
         size_t generation)
 {
-    auto& contribution =
-            d_allocation_history[key][d_num_snapshots].deallocations_by_snapshot[generation];
-    contribution.num_allocations += count_delta;
-    contribution.num_bytes += bytes_delta;
+    if (d_num_snapshots == generation) {
+        // Allocated and deallocated within the same snapshot. We can ignore this.
+        return;
+    }
+
+    auto& counts = d_allocation_history[std::make_tuple(generation, d_num_snapshots, key)];
+    counts.first += count_delta;
+    counts.second += bytes_delta;
 }
 
 void
-MultiSnapshotAggregator::captureSnapshot()
+AllocationLifetimeAggregator::captureSnapshot()
 {
     ++d_num_snapshots;
 }
 
-std::vector<Allocation>
-MultiSnapshotAggregator::getAllocationsInRange(size_t gen0, size_t gen1)
+std::vector<AllocationLifetime>
+AllocationLifetimeAggregator::generateIndex()
 {
+    struct KeyHash
+    {
+        size_t operator()(const std::pair<size_t, HighWaterMarkLocationKey>& key) const
+        {
+            size_t ret = HighWaterMarkLocationKeyHash{}(std::get<1>(key));
+            ret = (ret << 1) ^ std::get<0>(key);
+            return ret;
+        }
+    };
+
+    std::unordered_map<std::pair<size_t, HighWaterMarkLocationKey>, std::pair<size_t, size_t>, KeyHash>
+            leaks;
+
+    // Leaked simple allocations
+    for (const auto& [ptr, allocation_and_generation] : d_ptr_to_allocation) {
+        (void)ptr;
+        const auto& [allocation, generation] = allocation_and_generation;
+        auto& counts = leaks[std::make_pair(generation, extractKey(allocation))];
+        counts.first += 1;
+        counts.second += allocation.size;
+    }
+
+    // Leaked range allocations
+    for (const auto& [interval, allocation_ptr_and_generation] : d_mmap_intervals) {
+        const auto& [allocation_ptr, generation] = allocation_ptr_and_generation;
+        auto& counts = leaks[std::make_pair(generation, extractKey(*allocation_ptr))];
+        counts.first += 1;
+        counts.second += interval.size();
+    }
+
+    std::vector<AllocationLifetime> ret;
+
+    // Things that were leaked
+    for (const auto& [when_where, how_much] : leaks) {
+        const auto& [allocated_before, key] = when_where;
+        const auto& [n_allocations, n_bytes] = how_much;
+        ret.push_back({allocated_before, static_cast<size_t>(-1), key, n_allocations, n_bytes});
+    }
+
+    // Things that weren't leaked
+    for (const auto& [when_where, how_much] : d_allocation_history) {
+        const auto& [allocated_before, deallocated_before, key] = when_where;
+        const auto& [n_allocations, n_bytes] = how_much;
+        ret.push_back({allocated_before, deallocated_before, key, n_allocations, n_bytes});
+    }
+
+    std::sort(ret.begin(), ret.end());
+    return ret;
+}
+
+std::vector<Allocation>
+AllocationLifetimeAggregator::getLeaksFromRange(
+        const std::vector<AllocationLifetime>& index,
+        size_t gen0,
+        size_t gen1)
+{
+    auto first = std::lower_bound(index.begin(), index.end(), AllocationLifetime{gen0, gen1});
+    auto last = std::upper_bound(index.begin(), index.end(), AllocationLifetime{gen1, 0});
+
+    std::cout << "total records: " << index.size() << std::endl;
+    std::cout << "ignoring first " << first - index.begin() << " records" << std::endl;
+    std::cout << "ignoring last " << index.end() - last << " records" << std::endl;
+
+    std::unordered_map<HighWaterMarkLocationKey, std::pair<size_t, size_t>, HighWaterMarkLocationKeyHash>
+            leaks_by_location;
+
+    for (auto it = first; it != last; ++it) {
+        if (it->allocatedBeforeSnapshot >= gen0 && it->allocatedBeforeSnapshot <= gen1
+            && it->deallocatedBeforeSnapshot > gen1)
+        {
+            auto& amt = leaks_by_location[it->key];
+            amt.first += it->n_allocations;
+            amt.second += it->n_bytes;
+        }
+    }
+
     std::vector<Allocation> ret;
-
-    for (const auto& [key, delta_by_snapshot] : d_allocation_history) {
-        size_t num_allocations = 0;
-        size_t num_bytes = 0;
-        for (const auto& [snapshot, delta] : delta_by_snapshot) {
-            if (gen0 < snapshot && snapshot < gen1) {
-                num_allocations += delta.allocations_since_last_snapshot.num_allocations;
-                num_bytes += delta.allocations_since_last_snapshot.num_bytes;
-
-                for (const auto& [old_snapshot, contribution] : delta.deallocations_by_snapshot) {
-                    if (gen0 < old_snapshot && old_snapshot < gen1) {
-                        num_allocations -= contribution.num_allocations;
-                        num_bytes -= contribution.num_bytes;
-                    }
-                }
-            }
-        }
-
-        if (0 == num_allocations) {
-            continue;
-        }
-
+    for (const auto& [key, amt] : leaks_by_location) {
+        const auto& [num_bytes, num_allocations] = amt;
         ret.push_back(
                 {key.thread_id,
                  0,

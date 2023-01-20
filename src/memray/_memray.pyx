@@ -3,6 +3,7 @@ import contextlib
 import os
 import pathlib
 import sys
+import time
 
 cimport cython
 
@@ -37,15 +38,12 @@ from _memray.sink cimport Sink
 from _memray.sink cimport SocketSink
 from _memray.snapshot cimport AbstractAggregator
 from _memray.snapshot cimport AggregatedCaptureReaggregator
-from _memray.snapshot cimport AllocationDelta
-from _memray.snapshot cimport AllocationDeltaBySnapshot
-from _memray.snapshot cimport AllocationDeltaBySnapshotByLocation
+from _memray.snapshot cimport AllocationLifetime
 from _memray.snapshot cimport AllocationStatsAggregator
 from _memray.snapshot cimport HighWatermark
 from _memray.snapshot cimport HighWaterMarkAggregator
 from _memray.snapshot cimport HighWatermarkFinder
-from _memray.snapshot cimport HighWaterMarkLocationKey
-from _memray.snapshot cimport MultiSnapshotAggregator
+from _memray.snapshot cimport AllocationLifetimeAggregator
 from _memray.snapshot cimport Py_GetSnapshotAllocationRecords
 from _memray.snapshot cimport Py_ListFromSnapshotAllocationRecords
 from _memray.snapshot cimport SnapshotAllocationAggregator
@@ -300,7 +298,7 @@ cdef class AllocationRecord:
 
 cdef class AllocationStatsBySnapshot:
     cdef shared_ptr[RecordReader] reader
-    cdef MultiSnapshotAggregator aggregator
+    cdef vector[AllocationLifetime] index
 
 
 MemorySnapshot = collections.namedtuple("MemorySnapshot", "time rss heap")
@@ -791,7 +789,7 @@ cdef class FileReader:
             yield alloc
 
         reader.close()
-    
+
     def get_high_watermark_allocation_records(self, merge_threads=True):
         self._ensure_not_closed()
         if self._header["file_format"] == FileFormat.AGGREGATED_ALLOCATIONS:
@@ -806,12 +804,14 @@ cdef class FileReader:
         cdef size_t max_records = self._high_watermark.index + 1
         yield from self._aggregate_allocations(max_records, merge_threads)
 
-    def get_range_allocation_records(self, AllocationStatsBySnapshot index, size_t t0, size_t t1, merge_threads=True):
+    def get_range_allocation_records(self, AllocationStatsBySnapshot stats, size_t t0, size_t t1, merge_threads=True):
         self._ensure_not_closed()
         cdef size_t idx0 = 0
-        cdef size_t idx1 = self._memory_snapshots.size()
+        cdef size_t idx1 = -1
 
-        cdef Py_ssize_t i
+        start = time.time()
+
+        cdef size_t i
         for i in range(self._memory_snapshots.size()):
             if self._memory_snapshots[i].ms_since_epoch >= t0:
                 idx0 = i + 1
@@ -823,11 +823,14 @@ cdef class FileReader:
                 break
 
         ret = []
-        for loc in index.aggregator.getAllocationsInRange(idx0, idx1):
+        for loc in AllocationLifetimeAggregator.getLeaksFromRange(stats.index, idx0, idx1):
             elem = (loc.tid, loc.address, loc.size, <int>loc.allocator, loc.frame_index, loc.n_allocations, loc.native_frame_id, loc.native_segment_generation)
             alloc = AllocationRecord(elem)
             ret.append(alloc)
-            (<AllocationRecord> alloc)._reader = index.reader
+            (<AllocationRecord> alloc)._reader = stats.reader
+
+        end = time.time()
+        print(f"{len(ret)} leaks found in {end - start:.2f} seconds")
 
         return ret
 
@@ -878,21 +881,24 @@ cdef class FileReader:
             report_progress=self._report_progress
         )
 
+        cdef AllocationLifetimeAggregator aggregator
+
         with progress_indicator:
             while records_to_process > 0:
                 PyErr_CheckSignals()
                 ret = reader.nextRecord()
                 if ret == RecordResult.RecordResultAllocationRecord:
-                    stats.aggregator.addAllocation(reader.getLatestAllocation())
+                    aggregator.addAllocation(reader.getLatestAllocation())
                     records_to_process -= 1
                     progress_indicator.update(1)
                 elif ret == RecordResult.RecordResultMemoryRecord:
-                    stats.aggregator.captureSnapshot()
+                    aggregator.captureSnapshot()
                 else:
                     assert ret != RecordResult.RecordResultMemorySnapshot
                     assert ret != RecordResult.RecordResultAggregatedAllocationRecord
                     break
 
+        stats.index = aggregator.generateIndex()
         return stats
 
     def get_allocation_records(self):

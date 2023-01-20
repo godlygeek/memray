@@ -1,6 +1,7 @@
 import datetime
 import json
 import re
+import time
 from functools import partial
 from http.server import BaseHTTPRequestHandler
 from http.server import HTTPServer
@@ -122,6 +123,7 @@ class RequestHandler(BaseHTTPRequestHandler):
 
     def _get_time(self, data):
         # Get the strings from the request's JSON data
+        start = time.time()
         string1 = data["string1"]
         string2 = data["string2"]
 
@@ -152,3 +154,5 @@ class RequestHandler(BaseHTTPRequestHandler):
         )
         content = json.dumps({"data": reporter.data})
         self._send_response(content)
+        end = time.time()
+        print(f"time request completed in {end - start:.2f} seconds")

@@ -1,4 +1,5 @@
 """Tools for processing and filtering stack frames."""
+import functools
 import re
 from typing import Tuple
 
@@ -33,23 +34,24 @@ SYMBOL_IGNORELIST = {
 }
 
 
+@functools.cache
 def is_cpython_internal(frame: StackFrame) -> bool:
     symbol, file, *_ = frame
 
-    def _is_candidate() -> bool:
-        if "PyEval_EvalFrameEx" in symbol or "_PyEval_EvalFrameDefault" in symbol:
-            return True
-        if symbol.startswith(("PyEval", "_Py")):
-            return True
-        if "vectorcall" in symbol.lower():
-            return True
-        if symbol in SYMBOL_IGNORELIST:
-            return True
-        if "Objects/call.c" in file:
-            return True
-        return False
+    if "PyEval_EvalFrameEx" in symbol or "_PyEval_EvalFrameDefault" in symbol:
+        is_candidate = True
+    elif symbol.startswith(("PyEval", "_Py")):
+        is_candidate = True
+    elif "vectorcall" in symbol.lower():
+        is_candidate = True
+    elif symbol in SYMBOL_IGNORELIST:
+        is_candidate = True
+    elif "Objects/call.c" in file:
+        is_candidate = True
+    else:
+        is_candidate = False
 
-    if _is_candidate():
+    if is_candidate:
         return re.search(RE_CPYTHON_PATHS, file) is not None
     return False
 
