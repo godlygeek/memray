@@ -108,7 +108,7 @@ class RequestHandler(BaseHTTPRequestHandler):
         reporter = FlameGraphReporter.from_snapshot(
             allocations=[],
             memory_records=memory_records,
-            native_traces=False,
+            native_traces=self.reader.metadata.has_native_traces,
         )
         return reporter.get_html(
             kind="flamegraph_server",
@@ -146,7 +146,7 @@ class RequestHandler(BaseHTTPRequestHandler):
         reporter = FlameGraphReporter.from_snapshot(
             allocations=records,
             memory_records=[],
-            native_traces=False,
+            native_traces=self.reader.metadata.has_native_traces,
         )
         content = json.dumps({"data": reporter.data})
         self._send_response(content)
