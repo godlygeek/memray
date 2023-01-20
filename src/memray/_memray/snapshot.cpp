@@ -282,7 +282,8 @@ void
 HighWaterMarkAggregator::recordUsageDelta(
         const Allocation& allocation,
         size_t count_delta,
-        size_t bytes_delta)
+        size_t bytes_delta,
+        std::vector<Effect>* effects)
 {
     size_t new_heap_size = d_current_heap_size + bytes_delta;
     if (d_current_heap_size >= d_heap_size_at_last_peak && new_heap_size < d_current_heap_size) {
@@ -295,10 +296,22 @@ HighWaterMarkAggregator::recordUsageDelta(
     auto& history = getUsageHistory(allocation);
     history.count_since_last_peak += count_delta;
     history.bytes_since_last_peak += bytes_delta;
+
+    if (effects) {
+        HighWaterMarkLocationKey loc_key{
+                allocation.tid,
+                allocation.frame_index,
+                allocation.native_frame_id,
+                allocation.native_segment_generation,
+                allocation.allocator};
+        effects->push_back({loc_key, count_delta, bytes_delta});
+    }
 }
 
 void
-HighWaterMarkAggregator::addAllocation(const Allocation& allocation_or_deallocation)
+HighWaterMarkAggregator::addAllocation(
+        const Allocation& allocation_or_deallocation,
+        std::vector<Effect>* effects)
 {
     // Note: Deallocation records don't tell us where the memory was allocated,
     //       so we need to save the records for allocations and cross-reference
@@ -306,7 +319,7 @@ HighWaterMarkAggregator::addAllocation(const Allocation& allocation_or_deallocat
     switch (hooks::allocatorKind(allocation_or_deallocation.allocator)) {
         case hooks::AllocatorKind::SIMPLE_ALLOCATOR: {
             const Allocation& allocation = allocation_or_deallocation;
-            recordUsageDelta(allocation, 1, allocation.size);
+            recordUsageDelta(allocation, 1, allocation.size, effects);
             d_ptr_to_allocation[allocation.address] = allocation;
             break;
         }
@@ -315,14 +328,14 @@ HighWaterMarkAggregator::addAllocation(const Allocation& allocation_or_deallocat
             auto it = d_ptr_to_allocation.find(deallocation.address);
             if (it != d_ptr_to_allocation.end()) {
                 const Allocation& allocation = it->second;
-                recordUsageDelta(allocation, -1, -allocation.size);
+                recordUsageDelta(allocation, -1, -allocation.size, effects);
                 d_ptr_to_allocation.erase(it);
             }
             break;
         }
         case hooks::AllocatorKind::RANGED_ALLOCATOR: {
             const Allocation& allocation = allocation_or_deallocation;
-            recordUsageDelta(allocation, 1, allocation.size);
+            recordUsageDelta(allocation, 1, allocation.size, effects);
             d_mmap_intervals.addInterval(allocation.address, allocation.size, allocation);
             break;
         }
@@ -331,13 +344,13 @@ HighWaterMarkAggregator::addAllocation(const Allocation& allocation_or_deallocat
             auto removal_stats =
                     d_mmap_intervals.removeInterval(deallocation.address, deallocation.size);
             for (const auto& [interval, allocation] : removal_stats.freed_allocations) {
-                recordUsageDelta(allocation, -1, -interval.size());
+                recordUsageDelta(allocation, -1, -interval.size(), effects);
             }
             for (const auto& [interval, allocation] : removal_stats.shrunk_allocations) {
-                recordUsageDelta(allocation, 0, -interval.size());
+                recordUsageDelta(allocation, 0, -interval.size(), effects);
             }
             for (const auto& [interval, allocation] : removal_stats.split_allocations) {
-                recordUsageDelta(allocation, 1, -interval.size());
+                recordUsageDelta(allocation, 1, -interval.size(), effects);
             }
             break;
         }
@@ -405,6 +418,138 @@ HighWaterMarkAggregator::visitAllocations(const allocation_callback_t& callback)
         }
     }
     return true;
+}
+
+void
+MultiSnapshotAggregator::addAllocation(const Allocation& allocation_or_deallocation)
+{
+    // Note: Deallocation records don't tell us where the memory was allocated,
+    //       so we need to save the records for allocations and cross-reference
+    //       deallocations against them.
+    switch (hooks::allocatorKind(allocation_or_deallocation.allocator)) {
+        case hooks::AllocatorKind::SIMPLE_ALLOCATOR: {
+            const Allocation& allocation = allocation_or_deallocation;
+            size_t generation = d_num_snapshots;
+            recordAllocation(extractKey(allocation), 1, allocation.size);
+            d_ptr_to_allocation[allocation.address] = {allocation, generation};
+            break;
+        }
+        case hooks::AllocatorKind::SIMPLE_DEALLOCATOR: {
+            const Allocation& deallocation = allocation_or_deallocation;
+            auto it = d_ptr_to_allocation.find(deallocation.address);
+            if (it != d_ptr_to_allocation.end()) {
+                const auto& [allocation, generation] = it->second;
+                recordDeallocation(extractKey(allocation), 1, allocation.size, generation);
+                d_ptr_to_allocation.erase(it);
+            }
+            break;
+        }
+        case hooks::AllocatorKind::RANGED_ALLOCATOR: {
+            const Allocation& allocation = allocation_or_deallocation;
+            size_t generation = d_num_snapshots;
+            recordAllocation(extractKey(allocation), 1, allocation.size);
+            d_mmap_intervals.addInterval(allocation.address, allocation.size, {allocation, generation});
+            break;
+        }
+        case hooks::AllocatorKind::RANGED_DEALLOCATOR: {
+            const Allocation& deallocation = allocation_or_deallocation;
+            auto removal_stats =
+                    d_mmap_intervals.removeInterval(deallocation.address, deallocation.size);
+            for (const auto& [interval, pair] : removal_stats.freed_allocations) {
+                const auto& [allocation, generation_allocated] = pair;
+                recordDeallocation(extractKey(allocation), 1, interval.size(), generation_allocated);
+            }
+            for (const auto& [interval, pair] : removal_stats.shrunk_allocations) {
+                const auto& [allocation, generation_allocated] = pair;
+                recordDeallocation(extractKey(allocation), 0, interval.size(), generation_allocated);
+            }
+            for (const auto& [interval, pair] : removal_stats.split_allocations) {
+                const auto& [allocation, generation_allocated] = pair;
+                recordDeallocation(extractKey(allocation), -1, interval.size(), generation_allocated);
+            }
+            break;
+        }
+    }
+}
+
+HighWaterMarkLocationKey
+MultiSnapshotAggregator::extractKey(const Allocation& allocation)
+{
+    return {allocation.tid,
+            allocation.frame_index,
+            allocation.native_frame_id,
+            allocation.native_segment_generation,
+            allocation.allocator};
+}
+
+void
+MultiSnapshotAggregator::recordAllocation(
+        const HighWaterMarkLocationKey& key,
+        size_t count_delta,
+        size_t bytes_delta)
+{
+    auto& contribution = d_allocation_history[key][d_num_snapshots].allocations_since_last_snapshot;
+    contribution.num_allocations += count_delta;
+    contribution.num_bytes += bytes_delta;
+}
+
+void
+MultiSnapshotAggregator::recordDeallocation(
+        const HighWaterMarkLocationKey& key,
+        size_t count_delta,
+        size_t bytes_delta,
+        size_t generation)
+{
+    auto& contribution =
+            d_allocation_history[key][d_num_snapshots].deallocations_by_snapshot[generation];
+    contribution.num_allocations += count_delta;
+    contribution.num_bytes += bytes_delta;
+}
+
+void
+MultiSnapshotAggregator::captureSnapshot()
+{
+    ++d_num_snapshots;
+}
+
+std::vector<Allocation>
+MultiSnapshotAggregator::getAllocationsInRange(size_t gen0, size_t gen1)
+{
+    std::vector<Allocation> ret;
+
+    for (const auto& [key, delta_by_snapshot] : d_allocation_history) {
+        size_t num_allocations = 0;
+        size_t num_bytes = 0;
+        for (const auto& [snapshot, delta] : delta_by_snapshot) {
+            if (gen0 < snapshot && snapshot < gen1) {
+                num_allocations += delta.allocations_since_last_snapshot.num_allocations;
+                num_bytes += delta.allocations_since_last_snapshot.num_bytes;
+
+                for (const auto& [old_snapshot, contribution] : delta.deallocations_by_snapshot) {
+                    if (gen0 < old_snapshot && old_snapshot < gen1) {
+                        num_allocations -= contribution.num_allocations;
+                        num_bytes -= contribution.num_bytes;
+                    }
+                }
+            }
+        }
+
+        if (0 == num_allocations) {
+            continue;
+        }
+
+        ret.push_back(
+                {key.thread_id,
+                 0,
+                 num_bytes,
+                 key.allocator,
+                 key.native_frame_id,
+                 key.python_frame_id,
+                 key.native_segment_generation,
+                 num_allocations});
+    }
+
+    return ret;
 }
 
 /**

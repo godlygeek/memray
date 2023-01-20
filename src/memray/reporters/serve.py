@@ -18,11 +18,12 @@ class MemraySever:
     def __init__(self, file_path):
         self.file_path = file_path
         self.reader = FileReader(file_path, report_progress=True)
+        self.index = self.reader.get_allocation_delta_by_snapshot_by_location()
 
     def run(self, port=8000):
         server_address = ("", port)
         request_handler = partial(
-            RequestHandler, reader=self.reader, file_path=self.file_path
+            RequestHandler, reader=self.reader, file_path=self.file_path, index=self.index
         )
         httpd = HTTPServer(server_address, request_handler)
         print(f"Starting server on port {port}")
@@ -30,9 +31,10 @@ class MemraySever:
 
 
 class RequestHandler(BaseHTTPRequestHandler):
-    def __init__(self, *args, reader, file_path, **kwargs):
+    def __init__(self, *args, reader, file_path, index, **kwargs):
         self.reader = reader
         self.file_path = file_path
+        self.index = index
         super().__init__(*args, **kwargs)
 
     def _send_response(self, content, status=200):
@@ -141,7 +143,7 @@ class RequestHandler(BaseHTTPRequestHandler):
         time1_ms = int(time1.timestamp() * 1000)
         time2_ms = int(time2.timestamp() * 1000)
 
-        records = self.reader.get_range_allocation_records(time1_ms, time2_ms)
+        records = self.reader.get_range_allocation_records(self.index, time1_ms, time2_ms)
 
         reporter = FlameGraphReporter.from_snapshot(
             allocations=records,

@@ -37,10 +37,15 @@ from _memray.sink cimport Sink
 from _memray.sink cimport SocketSink
 from _memray.snapshot cimport AbstractAggregator
 from _memray.snapshot cimport AggregatedCaptureReaggregator
+from _memray.snapshot cimport AllocationDelta
+from _memray.snapshot cimport AllocationDeltaBySnapshot
+from _memray.snapshot cimport AllocationDeltaBySnapshotByLocation
 from _memray.snapshot cimport AllocationStatsAggregator
 from _memray.snapshot cimport HighWatermark
 from _memray.snapshot cimport HighWaterMarkAggregator
 from _memray.snapshot cimport HighWatermarkFinder
+from _memray.snapshot cimport HighWaterMarkLocationKey
+from _memray.snapshot cimport MultiSnapshotAggregator
 from _memray.snapshot cimport Py_GetSnapshotAllocationRecords
 from _memray.snapshot cimport Py_ListFromSnapshotAllocationRecords
 from _memray.snapshot cimport SnapshotAllocationAggregator
@@ -61,6 +66,7 @@ from libcpp.memory cimport unique_ptr
 from libcpp.string cimport string as cppstring
 from libcpp.unordered_map cimport unordered_map
 from libcpp.utility cimport move
+from libcpp.utility cimport pair
 from libcpp.vector cimport vector
 
 from ._destination import Destination
@@ -290,6 +296,11 @@ cdef class AllocationRecord:
         return (f"AllocationRecord<tid={hex(self.tid)}, address={hex(self.address)}, "
                 f"size={'N/A' if not self.size else size_fmt(self.size)}, allocator={self.allocator!r}, "
                 f"allocations={self.n_allocations}>")
+
+
+cdef class AllocationStatsBySnapshot:
+    cdef shared_ptr[RecordReader] reader
+    cdef MultiSnapshotAggregator aggregator
 
 
 MemorySnapshot = collections.namedtuple("MemorySnapshot", "time rss heap")
@@ -795,11 +806,30 @@ cdef class FileReader:
         cdef size_t max_records = self._high_watermark.index + 1
         yield from self._aggregate_allocations(max_records, merge_threads)
 
-    def get_range_allocation_records(self, size_t t0, size_t t1, merge_threads=True):
+    def get_range_allocation_records(self, AllocationStatsBySnapshot index, size_t t0, size_t t1, merge_threads=True):
         self._ensure_not_closed()
-        # If allocation 0 caused the peak, we need to process 1 record, etc
-        cdef size_t max_records = self._header["stats"]["n_allocations"]
-        yield from self._aggregate_allocations(max_records, merge_threads, t0=t0, t1=t1)
+        cdef size_t idx0 = 0
+        cdef size_t idx1 = self._memory_snapshots.size()
+
+        cdef Py_ssize_t i
+        for i in range(self._memory_snapshots.size()):
+            if self._memory_snapshots[i].ms_since_epoch >= t0:
+                idx0 = i + 1
+                break
+
+        for i in range(self._memory_snapshots.size() - 1, -1, -1):
+            if self._memory_snapshots[i].ms_since_epoch < t1:
+                idx1 = i + 1
+                break
+
+        ret = []
+        for loc in index.aggregator.getAllocationsInRange(idx0, idx1):
+            elem = (loc.tid, loc.address, loc.size, <int>loc.allocator, loc.frame_index, loc.n_allocations, loc.native_frame_id, loc.native_segment_generation)
+            alloc = AllocationRecord(elem)
+            ret.append(alloc)
+            (<AllocationRecord> alloc)._reader = index.reader
+
+        return ret
 
     def get_leaked_allocation_records(self, merge_threads=True):
         self._ensure_not_closed()
@@ -827,6 +857,43 @@ cdef class FileReader:
             merge_threads,
             temporary_buffer_size=threshold + 1,
         )
+
+    def get_allocation_delta_by_snapshot_by_location(self):
+        self._ensure_not_closed()
+        if self._header["file_format"] == FileFormat.AGGREGATED_ALLOCATIONS:
+            raise NotImplementedError(
+                "Can't get allocation history using a pre-aggregated capture file."
+            )
+
+        cdef AllocationStatsBySnapshot stats = AllocationStatsBySnapshot()
+        stats.reader = make_shared[RecordReader](
+            unique_ptr[FileSource](new FileSource(self._path))
+        )
+        cdef RecordReader* reader = stats.reader.get()
+
+        cdef size_t records_to_process = self._header["stats"]["n_allocations"]
+        cdef ProgressIndicator progress_indicator = ProgressIndicator(
+            "Processing allocation records",
+            total=records_to_process,
+            report_progress=self._report_progress
+        )
+
+        with progress_indicator:
+            while records_to_process > 0:
+                PyErr_CheckSignals()
+                ret = reader.nextRecord()
+                if ret == RecordResult.RecordResultAllocationRecord:
+                    stats.aggregator.addAllocation(reader.getLatestAllocation())
+                    records_to_process -= 1
+                    progress_indicator.update(1)
+                elif ret == RecordResult.RecordResultMemoryRecord:
+                    stats.aggregator.captureSnapshot()
+                else:
+                    assert ret != RecordResult.RecordResultMemorySnapshot
+                    assert ret != RecordResult.RecordResultAggregatedAllocationRecord
+                    break
+
+        return stats
 
     def get_allocation_records(self):
         self._ensure_not_closed()

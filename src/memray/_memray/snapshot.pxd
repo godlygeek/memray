@@ -1,3 +1,4 @@
+from _memray.hooks cimport Allocator
 from _memray.records cimport AggregatedAllocation
 from _memray.records cimport Allocation
 from _memray.records cimport optional_frame_id_t
@@ -47,6 +48,33 @@ cdef extern from "snapshot.h" namespace "memray::api":
         void addAllocation(const Allocation& allocation) except+
         size_t getCurrentHeapSize()
         bool visitAllocations[T](const T& callback) except+
+
+    cdef cppclass HighWaterMarkLocationKey:
+        unsigned long thread_id
+        size_t python_frame_id
+        size_t native_frame_id
+        size_t native_segment_generation
+        Allocator allocator
+
+    cdef cppclass HighWaterMarkLocationKeyHash:
+        pass
+
+    cdef cppclass Contribution "memray::api::MultiSnapshotAggregator::Contribution":
+        size_t num_allocations
+        size_t num_bytes
+
+    cdef cppclass AllocationDelta "memray::api::MultiSnapshotAggregator::AllocationDelta":
+        Contribution allocations_since_last_snapshot
+        unordered_map[size_t, Contribution] deallocations_by_snapshot
+
+    ctypedef unordered_map[size_t, AllocationDelta] AllocationDeltaBySnapshot "memray::api::MultiSnapshotAggregator::AllocationDeltaBySnapshot"
+
+    ctypedef unordered_map[HighWaterMarkLocationKey, AllocationDeltaBySnapshot, HighWaterMarkLocationKeyHash] AllocationDeltaBySnapshotByLocation "memray::api::MultiSnapshotAggregator::AllocationDeltaBySnapshotByLocation"
+
+    cdef cppclass MultiSnapshotAggregator:
+        void addAllocation(const Allocation& allocation) except+
+        void captureSnapshot()
+        vector[Allocation] getAllocationsInRange(size_t idx0, size_t idx1) except+
 
     cdef cppclass AllocationStatsAggregator:
         void addAllocation(const Allocation&, optional_frame_id_t python_frame_id) except+

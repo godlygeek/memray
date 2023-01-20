@@ -267,7 +267,14 @@ struct HighWaterMarkLocationKeyHash
 class HighWaterMarkAggregator
 {
   public:
-    void addAllocation(const Allocation& allocation);
+    struct Effect
+    {
+        HighWaterMarkLocationKey location;
+        size_t num_allocations;
+        size_t num_bytes;
+    };
+
+    void addAllocation(const Allocation& allocation, std::vector<Effect>* effects = nullptr);
     size_t getCurrentHeapSize() const noexcept;
 
     using allocation_callback_t = std::function<bool(const AggregatedAllocation&)>;
@@ -316,8 +323,60 @@ class HighWaterMarkAggregator
 
     UsageHistory& getUsageHistory(const Allocation& allocation);
     void refreshUsageHistory(UsageHistory& history);
-    void recordUsageDelta(const Allocation& allocation, size_t count_delta, size_t bytes_delta);
+    void recordUsageDelta(
+            const Allocation& allocation,
+            size_t count_delta,
+            size_t bytes_delta,
+            std::vector<Effect>* effects);
     reduced_snapshot_map_t getAllocations(bool merge_threads, bool stop_at_high_water_mark) const;
+};
+
+class MultiSnapshotAggregator
+{
+  public:
+    struct Contribution
+    {
+        size_t num_allocations;
+        size_t num_bytes;
+    };
+
+    struct AllocationDelta
+    {
+        Contribution allocations_since_last_snapshot;
+        std::unordered_map<size_t, Contribution> deallocations_by_snapshot;
+    };
+
+    using AllocationDeltaBySnapshot = std::unordered_map<size_t, AllocationDelta>;
+
+    using AllocationDeltaBySnapshotByLocation = std::unordered_map<
+            HighWaterMarkLocationKey,
+            AllocationDeltaBySnapshot,
+            HighWaterMarkLocationKeyHash>;
+
+    void addAllocation(const Allocation& allocation);
+    void captureSnapshot();
+
+    std::vector<Allocation> getAllocationsInRange(size_t gen0, size_t gen1);
+
+  private:
+    size_t d_num_snapshots{};
+
+    AllocationDeltaBySnapshotByLocation d_allocation_history;
+
+    // Simple allocations contributing to the current heap size.
+    std::unordered_map<uintptr_t, std::pair<Allocation, size_t>> d_ptr_to_allocation;
+
+    // Ranged allocations contributing to the current heap size.
+    IntervalTree<std::pair<Allocation, size_t>> d_mmap_intervals;
+
+    HighWaterMarkLocationKey extractKey(const Allocation& allocation);
+
+    void recordAllocation(const HighWaterMarkLocationKey& key, size_t count_delta, size_t bytes_delta);
+    void recordDeallocation(
+            const HighWaterMarkLocationKey& key,
+            size_t count_delta,
+            size_t bytes_delta,
+            size_t generation);
 };
 
 class AllocationStatsAggregator
