@@ -19,12 +19,13 @@ class MemraySever:
     def __init__(self, file_path):
         self.file_path = file_path
         self.reader = FileReader(file_path, report_progress=True)
-        self.index = self.reader.get_allocation_delta_by_snapshot_by_location()
+        self.intervals = self.reader.get_allocation_delta_by_snapshot_by_location()
+        print(len(self.intervals))
 
     def run(self, port=8000):
         server_address = ("", port)
         request_handler = partial(
-            RequestHandler, reader=self.reader, file_path=self.file_path, index=self.index
+            RequestHandler, reader=self.reader, file_path=self.file_path, intervals=self.intervals
         )
         httpd = HTTPServer(server_address, request_handler)
         print(f"Starting server on port {port}")
@@ -32,10 +33,10 @@ class MemraySever:
 
 
 class RequestHandler(BaseHTTPRequestHandler):
-    def __init__(self, *args, reader, file_path, index, **kwargs):
+    def __init__(self, *args, reader, file_path, intervals, **kwargs):
         self.reader = reader
         self.file_path = file_path
-        self.index = index
+        self.intervals = intervals
         super().__init__(*args, **kwargs)
 
     def _send_response(self, content, status=200):
@@ -108,51 +109,51 @@ class RequestHandler(BaseHTTPRequestHandler):
         except OSError:
             return "oh no"
 
-        reporter = FlameGraphReporter.from_snapshot(
-            allocations=[],
+        reporter = FlameGraphReporter.from_intervals(
+            intervals=self.intervals,
             memory_records=memory_records,
             native_traces=self.reader.metadata.has_native_traces,
         )
+        print("JSON len:", len(json.dumps(reporter.data, separators=(',', ':'))))
         return reporter.get_html(
             kind="flamegraph_server",
             metadata=self.reader.metadata,
             show_memory_leaks=False,
             merge_threads=True,
-            update_url="/time",
         )
 
-    def _get_time(self, data):
-        # Get the strings from the request's JSON data
-        start = time.time()
-        string1 = data["string1"]
-        string2 = data["string2"]
+    # def _get_time(self, data):
+    #     # Get the strings from the request's JSON data
+    #     start = time.time()
+    #     string1 = data["string1"]
+    #     string2 = data["string2"]
 
-        # Transform the strings to datetime objects
-        # Check if the string is 2023-01-16T16:30:19.221Z (some times plotly sends this format)
-        if re.match(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}.\d{3}Z", string1):
-            string1 = string1.replace("T", " ").replace("Z", "")
-        if re.match(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}.\d{3}Z", string2):
-            string2 = string2.replace("T", " ").replace("Z", "")
+    #     # Transform the strings to datetime objects
+    #     # Check if the string is 2023-01-16T16:30:19.221Z (some times plotly sends this format)
+    #     if re.match(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}.\d{3}Z", string1):
+    #         string1 = string1.replace("T", " ").replace("Z", "")
+    #     if re.match(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}.\d{3}Z", string2):
+    #         string2 = string2.replace("T", " ").replace("Z", "")
 
-        try:
-            time1 = datetime.datetime.strptime(string1, "%Y-%m-%d %H:%M:%S.%f")
-            time2 = datetime.datetime.strptime(string2, "%Y-%m-%d %H:%M:%S.%f")
-        except ValueError:
-            print("Invalid date format. Use 'YYYY-MM-DD HH:MM:SS.sss'")
-            return
+    #     try:
+    #         time1 = datetime.datetime.strptime(string1, "%Y-%m-%d %H:%M:%S.%f")
+    #         time2 = datetime.datetime.strptime(string2, "%Y-%m-%d %H:%M:%S.%f")
+    #     except ValueError:
+    #         print("Invalid date format. Use 'YYYY-MM-DD HH:MM:SS.sss'")
+    #         return
 
-        # Transform the datetime objects to milliseconds since the epoch
-        time1_ms = int(time1.timestamp() * 1000)
-        time2_ms = int(time2.timestamp() * 1000)
+    #     # Transform the datetime objects to milliseconds since the epoch
+    #     time1_ms = int(time1.timestamp() * 1000)
+    #     time2_ms = int(time2.timestamp() * 1000)
 
-        records = self.reader.get_range_allocation_records(self.index, time1_ms, time2_ms)
+    #     records = self.reader.get_range_allocation_records(self.index, time1_ms, time2_ms)
 
-        reporter = FlameGraphReporter.from_snapshot(
-            allocations=records,
-            memory_records=[],
-            native_traces=self.reader.metadata.has_native_traces,
-        )
-        content = json.dumps({"data": reporter.data})
-        self._send_response(content)
-        end = time.time()
-        print(f"time request completed in {end - start:.2f} seconds")
+    #     reporter = FlameGraphReporter.from_snapshot(
+    #         allocations=records,
+    #         memory_records=[],
+    #         native_traces=self.reader.metadata.has_native_traces,
+    #     )
+    #     content = json.dumps({"data": reporter.data})
+    #     self._send_response(content)
+    #     end = time.time()
+    #     print(f"time request completed in {end - start:.2f} seconds")

@@ -49,8 +49,19 @@ cdef extern from "snapshot.h" namespace "memray::api":
         size_t getCurrentHeapSize()
         bool visitAllocations[T](const T& callback) except+
 
+    cdef cppclass HighWaterMarkLocationKey:
+        unsigned long thread_id
+        size_t python_frame_id
+        size_t native_frame_id
+        size_t native_segment_generation
+        Allocator allocator
+
     cdef cppclass AllocationLifetime:
-        pass
+        size_t allocatedBeforeSnapshot
+        size_t deallocatedBeforeSnapshot
+        HighWaterMarkLocationKey key
+        size_t n_allocations
+        size_t n_bytes
 
     cdef cppclass AllocationLifetimeAggregator:
         void addAllocation(const Allocation& allocation) except+
