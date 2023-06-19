@@ -373,18 +373,12 @@ class HighWaterMarkAggregator
     bool visitAllocations(const allocation_callback_t& callback) const;
 
   private:
-    // For each call to captureSnapshot(), record the index of the highest
-    // high water mark found since the last snapshot was taken.
-    std::vector<size_t> d_high_water_mark_index_by_snapshot;
+    // The last element holds the highest water mark found for the current
+    // snapshot so far. Other elements hold the highest water mark found as of
+    // the time when captureSnapshot() was called to start a new snapshot.
+    std::vector<size_t> d_high_water_mark_index_by_snapshot{0};
+    std::vector<size_t> d_high_water_mark_bytes_by_snapshot{0};
 
-    // For each call to captureSnapshot(), record the heap size at the highest
-    // high water mark found since the last snapshot was taken.
-    std::vector<size_t> d_high_water_mark_bytes_by_snapshot;
-
-    // Number of high water marks found (incremented on the falling edge,
-    // as well as on a new snapshot being taken).
-    uint64_t d_peak_count{};
-    size_t d_heap_size_at_last_peak{};
     size_t d_current_heap_size{};
 
     // Information about allocations and deallocations, aggregated by location.

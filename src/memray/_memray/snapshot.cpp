@@ -325,7 +325,7 @@ UsageHistory::recordContributionsToCompletedSnapshots(
         const std::vector<size_t>& highest_peak_by_snapshot,
         std::vector<HistoricalContribution>& heap_contribution_by_snapshot) const
 {
-    size_t current_snapshot = highest_peak_by_snapshot.size();
+    size_t current_snapshot = highest_peak_by_snapshot.size() - 1;
     auto history = d_history;
 
     // If any snapshots have completed since this location's last allocation
@@ -381,7 +381,7 @@ UsageHistory::recordUsageDelta(
         size_t count_delta,
         size_t bytes_delta)
 {
-    size_t current_snapshot = highest_peak_by_snapshot.size();
+    size_t current_snapshot = highest_peak_by_snapshot.size() - 1;
     if (d_history.last_known_snapshot < current_snapshot) {
         d_history = recordContributionsToCompletedSnapshots(
                 highest_peak_by_snapshot,
@@ -439,7 +439,7 @@ UsageHistory::contributionsBySnapshot(
         const std::vector<size_t>& highest_peak_by_snapshot,
         size_t current_peak) const
 {
-    size_t current_snapshot = highest_peak_by_snapshot.size();
+    size_t current_snapshot = highest_peak_by_snapshot.size() - 1;
     auto ret = d_heap_contribution_by_snapshot;
 
     auto final = d_history;
@@ -479,17 +479,19 @@ HighWaterMarkAggregator::recordUsageDelta(
         size_t bytes_delta)
 {
     size_t new_heap_size = d_current_heap_size + bytes_delta;
-    if (d_current_heap_size >= d_heap_size_at_last_peak && new_heap_size < d_current_heap_size) {
+    if (d_current_heap_size >= d_high_water_mark_bytes_by_snapshot.back()
+        && new_heap_size < d_current_heap_size)
+    {
         // This is the falling edge of a peak we haven't yet recorded.
-        d_peak_count += 1;
-        d_heap_size_at_last_peak = d_current_heap_size;
+        d_high_water_mark_index_by_snapshot.back() += 1;
+        d_high_water_mark_bytes_by_snapshot.back() = d_current_heap_size;
     }
     d_current_heap_size = new_heap_size;
 
     auto& history = getUsageHistory(allocation);
     history.recordUsageDelta(
             d_high_water_mark_index_by_snapshot,
-            d_peak_count,
+            d_high_water_mark_index_by_snapshot.back(),
             count_delta,
             bytes_delta);
 }
@@ -544,19 +546,19 @@ HighWaterMarkAggregator::addAllocation(const Allocation& allocation_or_deallocat
 void
 HighWaterMarkAggregator::captureSnapshot()
 {
-    if (d_current_heap_size >= d_heap_size_at_last_peak) {
-        // We're currently on the rising edge of a new peak.
-        d_high_water_mark_index_by_snapshot.push_back(d_peak_count + 1);
-        d_high_water_mark_bytes_by_snapshot.push_back(d_current_heap_size);
-    } else {
-        d_high_water_mark_index_by_snapshot.push_back(d_peak_count);
-        d_high_water_mark_bytes_by_snapshot.push_back(d_heap_size_at_last_peak);
-    }
-
     // Count the start of a snapshot as a "peak", even though heap utilization
     // may in fact be lower than at a previous peak.
-    d_peak_count++;
-    d_heap_size_at_last_peak = d_current_heap_size;
+    d_high_water_mark_index_by_snapshot.push_back(d_high_water_mark_index_by_snapshot.back() + 1);
+    d_high_water_mark_bytes_by_snapshot.push_back(d_current_heap_size);
+
+    if (d_current_heap_size
+        >= d_high_water_mark_bytes_by_snapshot[d_high_water_mark_bytes_by_snapshot.size() - 2])
+    {
+        // We're currently on the rising edge of a new peak.
+        d_high_water_mark_index_by_snapshot[d_high_water_mark_index_by_snapshot.size() - 2] += 1;
+        d_high_water_mark_bytes_by_snapshot[d_high_water_mark_bytes_by_snapshot.size() - 2] =
+                d_current_heap_size;
+    }
 }
 
 size_t
@@ -578,8 +580,8 @@ HighWaterMarkAggregator::generateIndex() const
 {
     std::vector<AllocationLifetime> index;
 
-    uint64_t final_peak_count = d_peak_count;
-    if (d_current_heap_size >= d_heap_size_at_last_peak) {
+    uint64_t final_peak_count = d_high_water_mark_index_by_snapshot.back();
+    if (d_current_heap_size >= d_high_water_mark_bytes_by_snapshot.back()) {
         // We're currently at a new peak that we haven't yet fallen from.
         final_peak_count++;
     }
@@ -633,14 +635,14 @@ HighWaterMarkAggregator::visitAllocations(const allocation_callback_t& callback)
         }
     }
 
-    if (d_heap_size_at_last_peak > final_peak_bytes) {
-        final_peak_count = d_peak_count;
-        final_peak_bytes = d_heap_size_at_last_peak;
+    if (d_high_water_mark_bytes_by_snapshot.back() > final_peak_bytes) {
+        final_peak_count = d_high_water_mark_index_by_snapshot.back();
+        final_peak_bytes = d_high_water_mark_bytes_by_snapshot.back();
     }
 
     if (d_current_heap_size >= final_peak_bytes) {
         // We're currently at a new peak that we haven't yet fallen from.
-        final_peak_count = d_peak_count + 1;
+        final_peak_count = d_high_water_mark_index_by_snapshot.back() + 1;
         final_peak_bytes = d_current_heap_size;
     }
 
