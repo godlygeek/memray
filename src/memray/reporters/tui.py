@@ -3,6 +3,7 @@ from collections import defaultdict
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
+from functools import total_ordering
 from math import ceil
 from typing import DefaultDict
 from typing import Deque
@@ -16,13 +17,15 @@ from typing import Tuple
 from rich.markup import escape
 from rich.panel import Panel
 from rich.progress_bar import ProgressBar
+from rich.text import Text
+from textual import log
 from textual.app import App
 from textual.app import ComposeResult
-from textual.app import Screen
-from textual.app import Widget
 from textual.binding import Binding
 from textual.containers import Container
 from textual.reactive import reactive
+from textual.screen import Screen
+from textual.widget import Widget
 from textual.widgets import DataTable
 from textual.widgets import Footer
 from textual.widgets import Label
@@ -109,6 +112,30 @@ def _get_terminal_lines() -> int:
         return os.get_terminal_size().lines
     except OSError:
         return DEFAULT_TERMINAL_LINES
+
+
+@total_ordering
+class SortableText(Text):
+    __slots__ = ("value",)
+
+    def __init__(self, value, text, style=""):
+        self.value = value
+        super().__init__(str(text), style)
+
+    def __lt__(self, other):
+        if type(other) != SortableText:
+            return NotImplemented
+        return self.value < other.value
+
+    def __gt__(self, other):
+        if type(other) != SortableText:
+            return NotImplemented
+        return self.value > other.value
+
+    def __eq__(self, other):
+        if type(other) != SortableText:
+            return NotImplemented
+        return self.value == other.value
 
 
 def _size_to_color(proportion_of_total: float) -> str:
@@ -216,7 +243,8 @@ class TimeDisplay(Static):
 class Table(Widget):
     """Widget to display the TUI table."""
 
-    sort_column_id = reactive(1)
+    default_sort_column_id = 1
+    sort_column_id = reactive(default_sort_column_id)
     max_rows = reactive(None)
     snapshot = reactive(tuple())
     current_thread = reactive(0)
@@ -230,7 +258,7 @@ class Table(Widget):
         "Own Memory % ",
         "Allocation Count",
     ]
-    
+
     KEY_TO_COLUMN_NAME = {
         1: "total_memory",
         3: "own_memory",
@@ -244,24 +272,27 @@ class Table(Widget):
         self._terminal_size: int = _get_terminal_lines()
 
     def on_mount(self):
-        table = self.query_one("#body_table", DataTable)
-
-        for column_idx in range(len(self.columns)):
-            if column_idx == self.sort_column_id:
-                table.add_column(f"<{self.columns[column_idx]}>")
-            else:
-                table.add_column(self.columns[column_idx])
+        log("TUI.on_mount")
 
     def compose(self) -> ComposeResult:
-        yield DataTable(id="body_table", header_height=2, show_cursor=False)
+        log("compose")
+        table = DataTable(id="body_table", header_height=2, show_cursor=False)
+        for column_idx in range(len(self.columns)):
+            if column_idx == self.default_sort_column_id:
+                table.add_column(f"<{self.columns[column_idx]}>", key=str(column_idx))
+            else:
+                table.add_column(self.columns[column_idx], key=str(column_idx))
+        yield table
 
-    def watch_current_thread(self, _) -> None:
+    def watch_current_thread(self) -> None:
         """Called when the current_thread attribute changes."""
+        log(f"current_thread updated to {self.current_thread}")
         self.render_table(self.snapshot)
 
-    def watch_snapshot(self, snapshot) -> None:
+    def watch_snapshot(self) -> None:
         """Called when the snapshot attribute changes."""
-        self.render_table(snapshot)
+        log("watch_snapshot")
+        self.render_table(self.snapshot)
 
     def watch_sort_column_id(self, sort_column_id) -> None:
         """Called when the sort_column_id attribute changes."""
@@ -275,12 +306,17 @@ class Table(Widget):
             sort_column.label = f"<{self.columns[sort_column_id]}>"
             self._prev_sort_column_id = sort_column_id
 
-            table.sort(sort_column.key)
+            table.sort(sort_column.key, reverse=True)
 
     def render_table(self, snapshot) -> DataTable:
         """Method to render the TUI table."""
+        log("rendering table")
         max_rows = self.max_rows or self._terminal_size
         table = self.query_one("#body_table", DataTable)
+
+        if not table.columns:
+            log("no columns to render")
+            return table
 
         total_allocations = sum(record.n_allocations for record in snapshot)
         allocation_entries = aggregate_allocations(
@@ -296,9 +332,12 @@ class Table(Widget):
         )[:max_rows]
 
         # Clear previous table rows
-        table.clear()
+        old_locations = set(table.rows)
+        new_locations = set()
 
         for location, result in sorted_allocations:
+            new_locations.add(location)
+
             if self.current_thread not in result.thread_ids:
                 continue
             color_location = (
@@ -307,17 +346,35 @@ class Table(Widget):
             )
             total_color = _size_to_color(result.total_memory / self.current_memory_size)
             own_color = _size_to_color(result.own_memory / self.current_memory_size)
-            allocation_colors = _size_to_color(result.n_allocations / total_allocations)
+            allocation_color = _size_to_color(result.n_allocations / total_allocations)
+
             percent_total = result.total_memory / self.current_memory_size * 100
             percent_own = result.own_memory / self.current_memory_size * 100
-            table.add_row(
-                color_location,
-                f"[{total_color}]{size_fmt(result.total_memory)}[/{total_color}]",
-                f"[{total_color}]{percent_total:.2f}%[/{total_color}]",
-                f"[{own_color}]{size_fmt(result.own_memory)}[/{own_color}]",
-                f"[{own_color}]{percent_own:.2f}%[/{own_color}]",
-                f"[{allocation_colors}]{result.n_allocations}[/{allocation_colors}]",
-            )
+
+            cells = [
+                SortableText(
+                    result.total_memory, size_fmt(result.total_memory), total_color
+                ),
+                SortableText(result.total_memory, f"{percent_total:.2f}%", total_color),
+                SortableText(result.own_memory, size_fmt(result.own_memory), own_color),
+                SortableText(result.own_memory, f"{percent_own:.2f}%", own_color),
+                SortableText(
+                    result.n_allocations, result.n_allocations, allocation_color
+                ),
+            ]
+
+            row_key = color_location
+            if row_key not in table.rows:
+                table.add_row(color_location, *cells, key=row_key)
+            else:
+                for col_idx, val in enumerate(cells, 1):
+                    col_key = str(col_idx)
+                    table.update_cell(row_key, col_key, val)
+
+        for row_key in old_locations - new_locations:
+            table.remove_row(row_key)
+
+        table.sort(str(self.sort_column_id), reverse=True)
 
         return table
 
@@ -369,7 +426,7 @@ class Header(Widget):
     def watch_last_update(self, last_update: datetime) -> None:
         """Called when the last_update attribute changes."""
         self.query_one("#duration", Label).update(
-            f"[b]Duration[/]: {(last_update - self.start).total_seconds()} seconds"
+            f"[b]Duration[/]: {(last_update - self.start).total_seconds():.1f} seconds"
         )
 
 
@@ -420,12 +477,13 @@ class TUI(Screen):
     CSS_PATH = "tui.css"
 
     BINDINGS = [
-        Binding("q,esc", "quit", "Quit", "Q", priority=True),
-        Binding("left", "previous_thread", "Previous Thread", "←", priority=True),
-        Binding("right", "next_thread", "Next Thread", "→", priority=True),
-        Binding("t", "sort(1)", "Sort By Total", priority=True),
-        Binding("o", "sort(3)", "Sort By Own", priority=True),
-        Binding("a", "sort(5)", "Sort By Allocations", priority=True),
+        Binding("q,esc", "quit", "Quit"),
+        Binding("<,left", "previous_thread", "Previous Thread"),
+        Binding(">,right", "next_thread", "Next Thread"),
+        Binding("t", "sort(1)", "Sort by Total"),
+        Binding("o", "sort(3)", "Sort by Own"),
+        Binding("a", "sort(5)", "Sort by Allocations"),
+        Binding("space", "toggle_pause", "Pause"),
     ]
 
     # Start with a non-empty list of threads so that we always have something
@@ -435,9 +493,12 @@ class TUI(Screen):
     stream = MemoryGraph(50, 4, 0.0, 1024.0)
 
     thread_idx = reactive(0)
-    threads = reactive(_DUMMY_THREAD_LIST)
+    threads = reactive(_DUMMY_THREAD_LIST, always_update=True)
     current_memory_size = reactive(0)
     graph = reactive(stream.graph)
+    paused = reactive(False)
+    disconnected = reactive(False)
+    footer_message = reactive("")
 
     def __init__(self, pid: Optional[int], cmd_line: Optional[str], native: bool):
         self.pid, self.cmd_line, self.native = pid, cmd_line, native
@@ -450,11 +511,6 @@ class TUI(Screen):
     def current_thread(self) -> int:
         return self.threads[self.thread_idx]
 
-    def get_body(self, *, max_rows: Optional[int] = None) -> DataTable:
-        """Method which returns the TUI table textual component."""
-        self.query_one("#body_table", DataTable).max_rows = max_rows
-        return self.query_one(Table).render_table(self._snapshot)
-
     def action_previous_thread(self) -> None:
         """An action to switch to previous thread."""
         self.thread_idx = (self.thread_idx - 1) % len(self.threads)
@@ -466,6 +522,17 @@ class TUI(Screen):
     def action_sort(self, col_number: int) -> None:
         """An action to sort the table rows based on a given column attribute."""
         self.update_sort_key(col_number)
+
+    def action_toggle_pause(self) -> None:
+        """Toggle pause on keypress"""
+        if self.paused or not self.disconnected:
+            self.paused = not self.paused
+            if self.paused:
+                self.app.bind("space", "toggle_pause", description="Unpause")
+            else:
+                self.app.bind("space", "toggle_pause", description="Pause")
+            if not self.paused:
+                self.display_snapshot()
 
     def watch_thread_idx(self, thread_idx: int) -> None:
         """Called when the thread_idx attribute changes."""
@@ -499,6 +566,20 @@ class TUI(Screen):
             )
         )
 
+    def watch_disconnected(self) -> None:
+        self.update_label()
+
+    def watch_paused(self) -> None:
+        self.update_label()
+
+    def update_label(self) -> None:
+        message = []
+        if self.paused:
+            message.append("[yellow]Paused[/]")
+        if self.disconnected:
+            message.append("[red]Remote has disconnected[/]")
+        self.query_one("#message", Label).update(" ".join(message))
+
     def compose(self) -> ComposeResult:
         yield Container(
             Label("[b]Memray[/b] live tracking", id="head_title"),
@@ -522,36 +603,46 @@ class TUI(Screen):
 
     def update_snapshot(self, snapshot: Iterable[AllocationRecord]) -> None:
         """Method called to update snapshot."""
+        self._latest_snapshot = tuple(snapshot)
+        self.display_snapshot()
+
+    def display_snapshot(self) -> None:
+        snapshot = self._latest_snapshot
+
         header = self.query_one(Header)
         heap = self.query_one(HeapSize)
         body = self.query_one(Table)
 
-        body.snapshot = tuple(snapshot)
-
-        threads = self.threads
-        for record in body.snapshot:
-            if record.tid in self._seen_threads:
-                continue
-            if threads is self._DUMMY_THREAD_LIST:
-                threads = []
-            threads.append(record.tid)
-            self._seen_threads.add(record.tid)
-
-        self.threads = threads
+        # We want to update many header fields even when paused
         header.n_samples += 1
         header.last_update = datetime.now()
 
-        self.current_memory_size = sum(record.size for record in body.snapshot)
+        self.current_memory_size = sum(record.size for record in snapshot)
         if self.current_memory_size > heap.max_memory_seen:
             heap.max_memory_seen = self.current_memory_size
             self.stream.reset_max(heap.max_memory_seen)
         self.stream.add_value(self.current_memory_size)
-
-        # Update the header panel graph
         self.graph = self.stream.graph
 
-        # Update the body current_thread attribute
+        # Other fields should only be updated when not paused.
+        if self.paused:
+            return
+
+        new_tids = {record.tid for record in snapshot} - self._seen_threads
+        self._seen_threads.update(new_tids)
+
+        if new_tids:
+            threads = self.threads
+            if threads is self._DUMMY_THREAD_LIST:
+                threads = []
+            for tid in sorted(new_tids):
+                threads.append(tid)
+            self.threads = threads
+
         body.current_thread = self.current_thread
+        if not self.paused:
+            log("Updating snapshot!")
+            body.snapshot = snapshot
 
     def update_sort_key(self, col_number: int) -> None:
         """Method called to update the table sort key attribute."""
@@ -578,17 +669,17 @@ class TUIApp(App):
                 native=self._reader.has_native_traces,
             )
         )
+        log(self.namespace_bindings)
 
     def _automatic_refresh(self) -> None:
         """Method called every auto_refresh seconds."""
         if self.active:
             snapshot = list(self._reader.get_current_snapshot(merge_threads=False))
-            self.query_one(TUI).update_snapshot(snapshot)
-
+            tui = self.query_one(TUI)
+            tui.update_snapshot(snapshot)
             if not self._reader.is_active:
                 self.active = False
-                self.query_one("#message", Label).update(
-                    "[red]Remote has disconnected[/]"
-                )
+                log("setting disconnected")
+                tui.disconnected = True
 
         super()._automatic_refresh()
