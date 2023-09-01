@@ -476,6 +476,8 @@ class TUI(Screen):
 
     CSS_PATH = "tui.css"
 
+    TOGGLE_PAUSE_BINDING = Binding("space", "toggle_pause", "Pause")
+
     BINDINGS = [
         Binding("q,esc", "quit", "Quit"),
         Binding("<,left", "previous_thread", "Previous Thread"),
@@ -483,7 +485,7 @@ class TUI(Screen):
         Binding("t", "sort(1)", "Sort by Total"),
         Binding("o", "sort(3)", "Sort by Own"),
         Binding("a", "sort(5)", "Sort by Allocations"),
-        Binding("space", "toggle_pause", "Pause"),
+        TOGGLE_PAUSE_BINDING,
     ]
 
     # Start with a non-empty list of threads so that we always have something
@@ -527,10 +529,11 @@ class TUI(Screen):
         """Toggle pause on keypress"""
         if self.paused or not self.disconnected:
             self.paused = not self.paused
-            if self.paused:
-                self.app.bind("space", "toggle_pause", description="Unpause")
-            else:
-                self.app.bind("space", "toggle_pause", description="Pause")
+            object.__setattr__(self.TOGGLE_PAUSE_BINDING, "description", "Unpause" if self.paused else "Pause")
+            log(self.TOGGLE_PAUSE_BINDING)
+            log(self.app.namespace_bindings)
+            self.app.query_one(Footer).highlight_key = "space"
+            self.app.query_one(Footer).highlight_key = None
             if not self.paused:
                 self.display_snapshot()
 

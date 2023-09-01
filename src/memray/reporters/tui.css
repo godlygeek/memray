@@ -1,13 +1,13 @@
 TUI {
-    layout: grid;
-    grid-size: 1 6;
-    grid-rows: 2fr 7fr 3fr 70% 1fr 1fr;
-    padding: 0 1;
+    layout: vertical;
+    /*grid-size: 1 6;*/
+    /*grid-rows: 2 7 2 1fr 1;*/
 }
 
 /* Head */
 #head {
     layout: horizontal;
+    height: 1;
 }
 
 #head_title {
@@ -20,6 +20,10 @@ TUI {
 }
 
 /* Header */
+Header {
+    height: 7;
+}
+
 #header_container {
     height: 100%;
     layout: grid;
@@ -46,6 +50,10 @@ TUI {
 }
 
 /* Heap size */
+HeapSize {
+    height: 2;
+}
+
 #heap_size {
     layout: horizontal;
 }
@@ -60,7 +68,7 @@ TUI {
 }
 
 #progress_bar {
-    height: 1fr;
+    height: 1;
 }
 
 /* Override default footer styling */
@@ -72,7 +80,12 @@ Footer > .footer--key {
     background: rgb(30, 144, 255);
 }
 
+#panel {
+    overflow: hidden hidden;
+}
+
 /* Override default table styling */
-DataTable {
-    border: solid white;
+Table {
+    border: hkey white;
+    height: 1fr;
 }
