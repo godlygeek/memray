@@ -1,4 +1,5 @@
 import os
+import threading
 from collections import defaultdict
 from collections import deque
 from dataclasses import dataclass
@@ -23,6 +24,7 @@ from textual.app import App
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Container
+from textual.message import Message
 from textual.reactive import reactive
 from textual.screen import Screen
 from textual.widget import Widget
@@ -38,6 +40,13 @@ from memray._memray import size_fmt
 MAX_MEMORY_RATIO = 0.95
 
 DEFAULT_TERMINAL_LINES = 24
+
+
+class SnapshotFetched(Message):
+    def __init__(self, snapshot: List[AllocationRecord], disconnected: bool) -> None:
+        self.snapshot = snapshot
+        self.disconnected = disconnected
+        super().__init__()
 
 
 class MemoryGraph:
@@ -529,7 +538,11 @@ class TUI(Screen):
         """Toggle pause on keypress"""
         if self.paused or not self.disconnected:
             self.paused = not self.paused
-            object.__setattr__(self.TOGGLE_PAUSE_BINDING, "description", "Unpause" if self.paused else "Pause")
+            object.__setattr__(
+                self.TOGGLE_PAUSE_BINDING,
+                "description",
+                "Unpause" if self.paused else "Pause",
+            )
             log(self.TOGGLE_PAUSE_BINDING)
             log(self.app.namespace_bindings)
             self.app.query_one(Footer).highlight_key = "space"
@@ -653,6 +666,37 @@ class TUI(Screen):
         body.sort_column_id = col_number
 
 
+class UpdateThread(threading.Thread):
+    def __init__(self, app: App, reader: SocketReader) -> None:
+        self._app = app
+        self._reader = reader
+        self._update_requested = threading.Event()
+        self._canceled = threading.Event()
+        super().__init__()
+
+    def run(self) -> None:
+        while self._update_requested.wait():
+            if self._canceled.is_set():
+                return
+            self._update_requested.clear()
+            self._app.post_message(
+                SnapshotFetched(
+                    list(self._reader.get_current_snapshot(merge_threads=False)),
+                    not self._reader.is_active,
+                )
+            )
+
+            if not self._reader.is_active:
+                return
+
+    def cancel(self):
+        self._canceled.set()
+        self._update_requested.set()
+
+    def schedule_update(self) -> None:
+        self._update_requested.set()
+
+
 class TUIApp(App):
     """TUI main application class."""
 
@@ -664,7 +708,10 @@ class TUIApp(App):
         super().__init__()
 
     def on_mount(self):
-        self.auto_refresh = 0.1
+        self.update_thread = UpdateThread(self, self._reader)
+        self.update_thread.start()
+
+        self.set_interval(0.1, self.update_thread.schedule_update)
         self.push_screen(
             TUI(
                 pid=self._reader.pid,
@@ -674,15 +721,17 @@ class TUIApp(App):
         )
         log(self.namespace_bindings)
 
-    def _automatic_refresh(self) -> None:
-        """Method called every auto_refresh seconds."""
-        if self.active:
-            snapshot = list(self._reader.get_current_snapshot(merge_threads=False))
-            tui = self.query_one(TUI)
-            tui.update_snapshot(snapshot)
-            if not self._reader.is_active:
-                self.active = False
-                log("setting disconnected")
-                tui.disconnected = True
+    def on_unmount(self):
+        self.update_thread.cancel()
+        self.update_thread.join()
+        log("!!! THREAD JOINED")
 
-        super()._automatic_refresh()
+    def on_snapshot_fetched(self, message: SnapshotFetched) -> None:
+        """Method called to process each fetched snapshot."""
+        log("on snapshot fetched")
+        tui = self.query_one(TUI)
+        tui.update_snapshot(message.snapshot)
+        if message.disconnected:
+            self.active = False
+            log("setting disconnected")
+            tui.disconnected = True
