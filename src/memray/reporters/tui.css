@@ -1,7 +1,5 @@
 TUI {
     layout: vertical;
-    /*grid-size: 1 6;*/
-    /*grid-rows: 2 7 2 1fr 1;*/
 }
 
 /* Head */
@@ -29,7 +27,6 @@ Header {
     layout: grid;
     grid-size: 3 1;
     grid-columns: 2fr 5fr 3fr;
-    text-align: left;
 }
 
 #header_metadata {

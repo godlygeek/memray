@@ -1,4 +1,3 @@
-import os
 import threading
 from collections import defaultdict
 from collections import deque
@@ -42,8 +41,32 @@ MAX_MEMORY_RATIO = 0.95
 DEFAULT_TERMINAL_LINES = 24
 
 
+@dataclass(frozen=True)
+class Location:
+    function: str
+    file: str
+
+
+@dataclass
+class AllocationEntry:
+    own_memory: int
+    total_memory: int
+    n_allocations: int
+    thread_ids: Set[int]
+
+
+@dataclass(frozen=True, eq=False)
+class Snapshot:
+    heap_size: int
+    records: List[AllocationRecord]
+    records_by_location: Dict[Location, AllocationEntry]
+
+
+_EMPTY_SNAPSHOT = Snapshot(heap_size=0, records=[], records_by_location={})
+
+
 class SnapshotFetched(Message):
-    def __init__(self, snapshot: List[AllocationRecord], disconnected: bool) -> None:
+    def __init__(self, snapshot: Snapshot, disconnected: bool) -> None:
         self.snapshot = snapshot
         self.disconnected = disconnected
         super().__init__()
@@ -116,13 +139,6 @@ class MemoryGraph:
         return tuple("".join(chars) for chars in self._graph)
 
 
-def _get_terminal_lines() -> int:
-    try:
-        return os.get_terminal_size().lines
-    except OSError:
-        return DEFAULT_TERMINAL_LINES
-
-
 @total_ordering
 class SortableText(Text):
     __slots__ = ("value",)
@@ -156,20 +172,6 @@ def _size_to_color(proportion_of_total: float) -> str:
         return "green"
     else:
         return "bright_green"
-
-
-@dataclass(frozen=True, eq=True)
-class Location:
-    function: str
-    file: str
-
-
-@dataclass
-class AllocationEntry:
-    own_memory: int
-    total_memory: int
-    n_allocations: int
-    thread_ids: Set[int]
 
 
 def aggregate_allocations(
@@ -229,24 +231,14 @@ def aggregate_allocations(
 
 
 class TimeDisplay(Static):
-    """Widget to display the TUI current time."""
-
-    time = reactive(datetime.now())
+    """TUI widget to display the current time."""
 
     def __init__(self, id):
         super().__init__(id=id)
 
     def on_mount(self) -> None:
-        """Event handler called when widget is added to the app."""
-        self.set_interval(1 / 60, self.update_time)
-
-    def update_time(self) -> None:
-        """Method to update the time to the current time."""
-        self.time = datetime.now()
-
-    def watch_time(self, time: float) -> None:
-        """Called when the time attribute changes."""
-        self.update(time.ctime().replace(":", "[blink]:[/]"))
+        """Event handler called when the widget is added to the app."""
+        self.set_interval(0.1, lambda: self.update(datetime.now().ctime()))
 
 
 class Table(Widget):
@@ -255,9 +247,8 @@ class Table(Widget):
     default_sort_column_id = 1
     sort_column_id = reactive(default_sort_column_id)
     max_rows = reactive(None)
-    snapshot = reactive(tuple())
+    snapshot = reactive(_EMPTY_SNAPSHOT)
     current_thread = reactive(0)
-    current_memory_size = reactive(0)
 
     columns = [
         "Location",
@@ -278,7 +269,6 @@ class Table(Widget):
         super().__init__()
         self._native = native
         self._prev_sort_column_id = 1
-        self._terminal_size: int = _get_terminal_lines()
 
     def on_mount(self):
         log("TUI.on_mount")
@@ -296,12 +286,12 @@ class Table(Widget):
     def watch_current_thread(self) -> None:
         """Called when the current_thread attribute changes."""
         log(f"current_thread updated to {self.current_thread}")
-        self.render_table(self.snapshot)
+        self.populate_table()
 
     def watch_snapshot(self) -> None:
         """Called when the snapshot attribute changes."""
         log("watch_snapshot")
-        self.render_table(self.snapshot)
+        self.populate_table()
 
     def watch_sort_column_id(self, sort_column_id) -> None:
         """Called when the sort_column_id attribute changes."""
@@ -309,7 +299,7 @@ class Table(Widget):
 
         if self._prev_sort_column_id != self.sort_column_id:
             prev_sort_column = table.ordered_columns[self._prev_sort_column_id]
-            prev_sort_column.label = self.columns[self._prev_sort_column_id]
+            prev_sort_column.label = Text(self.columns[self._prev_sort_column_id])
 
             sort_column = table.ordered_columns[sort_column_id]
             sort_column.label = f"<{self.columns[sort_column_id]}>"
@@ -317,28 +307,24 @@ class Table(Widget):
 
             table.sort(sort_column.key, reverse=True)
 
-    def render_table(self, snapshot) -> DataTable:
+    def populate_table(self) -> None:
         """Method to render the TUI table."""
-        log("rendering table")
-        max_rows = self.max_rows or self._terminal_size
+        log("populating table")
         table = self.query_one("#body_table", DataTable)
 
         if not table.columns:
             log("no columns to render")
-            return table
+            return
 
-        total_allocations = sum(record.n_allocations for record in snapshot)
-        allocation_entries = aggregate_allocations(
-            snapshot, MAX_MEMORY_RATIO * self.current_memory_size, self._native
-        )
-
+        allocation_entries = self.snapshot.records_by_location
+        total_allocations = self.snapshot.heap_size
         sorted_allocations = sorted(
             allocation_entries.items(),
             key=lambda item: getattr(  # type: ignore[no-any-return]
                 item[1], self.KEY_TO_COLUMN_NAME[self.sort_column_id]
             ),
             reverse=True,
-        )[:max_rows]
+        )
 
         # Clear previous table rows
         old_locations = set(table.rows)
@@ -353,12 +339,12 @@ class Table(Widget):
                 f"[bold magenta]{escape(location.function)}[/] at "
                 f"[cyan]{escape(location.file)}[/]"
             )
-            total_color = _size_to_color(result.total_memory / self.current_memory_size)
-            own_color = _size_to_color(result.own_memory / self.current_memory_size)
+            total_color = _size_to_color(result.total_memory / total_allocations)
+            own_color = _size_to_color(result.own_memory / total_allocations)
             allocation_color = _size_to_color(result.n_allocations / total_allocations)
 
-            percent_total = result.total_memory / self.current_memory_size * 100
-            percent_own = result.own_memory / self.current_memory_size * 100
+            percent_total = result.total_memory / total_allocations * 100
+            percent_own = result.own_memory / total_allocations * 100
 
             cells = [
                 SortableText(
@@ -384,8 +370,6 @@ class Table(Widget):
             table.remove_row(row_key)
 
         table.sort(str(self.sort_column_id), reverse=True)
-
-        return table
 
 
 class Header(Widget):
@@ -505,8 +489,7 @@ class TUI(Screen):
 
     thread_idx = reactive(0)
     threads = reactive(_DUMMY_THREAD_LIST, always_update=True)
-    current_memory_size = reactive(0)
-    graph = reactive(stream.graph)
+    snapshot = reactive(_EMPTY_SNAPSHOT)
     paused = reactive(False)
     disconnected = reactive(False)
     footer_message = reactive("")
@@ -565,28 +548,16 @@ class TUI(Screen):
             f"[b]Thread[/] {self.thread_idx + 1} of {len(threads)}"
         )
 
-    def watch_current_memory_size(self, current_memory_size: int) -> None:
-        """Called when the current_memory_size attribute changes."""
-        self.query_one(HeapSize).current_memory_size = current_memory_size
-        self.query_one(Table).current_memory_size = current_memory_size
-
-    def watch_graph(self, graph: List[Deque[str]]) -> None:
-        """Called when the graph attribute changes to update the header panel."""
-        self.query_one("#panel", Static).update(
-            Panel(
-                "\n".join(graph),
-                title="Memory",
-                title_align="left",
-                border_style="green",
-                expand=False,
-            )
-        )
-
     def watch_disconnected(self) -> None:
         self.update_label()
 
     def watch_paused(self) -> None:
         self.update_label()
+
+    def watch_snapshot(self, snapshot: Snapshot) -> None:
+        """Called automatically when the snapshot attribute is updated"""
+        self._latest_snapshot = snapshot
+        self.display_snapshot()
 
     def update_label(self) -> None:
         message = []
@@ -602,25 +573,11 @@ class TUI(Screen):
             TimeDisplay(id="head_time_display"),
             id="head",
         )
-        yield Header(pid=self.pid, cmd_line=escape(self.cmd_line))
+        yield Header(pid=self.pid, cmd_line=escape(self.cmd_line or ""))
         yield HeapSize()
         yield Table(native=self.native)
         yield Label(id="message")
         yield Footer()
-
-    def get_header(self):
-        return self.query_one("head", Container) + "\n" + self.query_one(Header)
-
-    def get_body(self):
-        return self.query_one(Table)
-
-    def get_heap_size(self):
-        return self.query_one(HeapSize)
-
-    def update_snapshot(self, snapshot: Iterable[AllocationRecord]) -> None:
-        """Method called to update snapshot."""
-        self._latest_snapshot = tuple(snapshot)
-        self.display_snapshot()
 
     def display_snapshot(self) -> None:
         snapshot = self._latest_snapshot
@@ -633,18 +590,27 @@ class TUI(Screen):
         header.n_samples += 1
         header.last_update = datetime.now()
 
-        self.current_memory_size = sum(record.size for record in snapshot)
-        if self.current_memory_size > heap.max_memory_seen:
-            heap.max_memory_seen = self.current_memory_size
+        heap.current_memory_size = snapshot.heap_size
+        if snapshot.heap_size > heap.max_memory_seen:
+            heap.max_memory_seen = snapshot.heap_size
             self.stream.reset_max(heap.max_memory_seen)
-        self.stream.add_value(self.current_memory_size)
-        self.graph = self.stream.graph
+        self.stream.add_value(snapshot.heap_size)
+
+        self.query_one("#panel", Static).update(
+            Panel(
+                "\n".join(self.stream.graph),
+                title="Memory",
+                title_align="left",
+                border_style="green",
+                expand=False,
+            )
+        )
 
         # Other fields should only be updated when not paused.
         if self.paused:
             return
 
-        new_tids = {record.tid for record in snapshot} - self._seen_threads
+        new_tids = {record.tid for record in snapshot.records} - self._seen_threads
         self._seen_threads.update(new_tids)
 
         if new_tids:
@@ -679,9 +645,21 @@ class UpdateThread(threading.Thread):
             if self._canceled.is_set():
                 return
             self._update_requested.clear()
+
+            records = list(self._reader.get_current_snapshot(merge_threads=False))
+            heap_size = sum(record.size for record in records)
+            records_by_location = aggregate_allocations(
+                records, MAX_MEMORY_RATIO * heap_size, self._reader.has_native_traces
+            )
+            snapshot = Snapshot(
+                heap_size=heap_size,
+                records=records,
+                records_by_location=records_by_location,
+            )
+
             self._app.post_message(
                 SnapshotFetched(
-                    list(self._reader.get_current_snapshot(merge_threads=False)),
+                    snapshot,
                     not self._reader.is_active,
                 )
             )
@@ -711,7 +689,7 @@ class TUIApp(App):
         self.update_thread = UpdateThread(self, self._reader)
         self.update_thread.start()
 
-        self.set_interval(0.1, self.update_thread.schedule_update)
+        self.set_interval(1, self.update_thread.schedule_update)
         self.push_screen(
             TUI(
                 pid=self._reader.pid,
@@ -724,13 +702,14 @@ class TUIApp(App):
     def on_unmount(self):
         self.update_thread.cancel()
         self.update_thread.join()
-        log("!!! THREAD JOINED")
+        log("TUI update thread gracefully stopped")
 
     def on_snapshot_fetched(self, message: SnapshotFetched) -> None:
         """Method called to process each fetched snapshot."""
         log("on snapshot fetched")
         tui = self.query_one(TUI)
-        tui.update_snapshot(message.snapshot)
+        with self.batch_update():
+            tui.snapshot = message.snapshot
         if message.disconnected:
             self.active = False
             log("setting disconnected")
