@@ -15,8 +15,8 @@ from typing import Set
 from typing import Tuple
 
 from rich.markup import escape
-from rich.panel import Panel
 from rich.progress_bar import ProgressBar
+from rich.segment import Segment
 from rich.text import Text
 from textual import log
 from textual.app import App
@@ -26,6 +26,7 @@ from textual.containers import Container
 from textual.message import Message
 from textual.reactive import reactive
 from textual.screen import Screen
+from textual.strip import Strip
 from textual.widget import Widget
 from textual.widgets import DataTable
 from textual.widgets import Footer
@@ -72,23 +73,28 @@ class SnapshotFetched(Message):
         super().__init__()
 
 
-class MemoryGraph:
-    def __init__(
-        self,
-        width: int,
-        height: int,
-        minval: float,
-        maxval: float,
-    ):
-        self._graph: List[Deque[str]] = [deque(maxlen=width) for _ in range(height)]
-        self.width = width
-        self.height = height
-        self.minval = minval
-        self.maxval = maxval
+class MemoryGraph(Widget):
+    DEFAULT_CSS = """
+    MemoryGraph {
+    }
+    """
+
+    lines: reactive[Tuple[str, ...]] = reactive(())
+
+    def __init__(self, *args, max_data_points: int, **kwargs):
+        super().__init__(*args, **kwargs)
+        height: int = 4
+        minval: float = 0.0
+        maxval: float = 1024.0
+        self._width = max_data_points
+        self._graph: List[Deque[str]] = [deque(maxlen=self._width) for _ in range(height)]
+        self._height = height
+        self._minval = minval
+        self._maxval = maxval
         self._previous_blocks = [0] * height
-        values = [minval] * (2 * self.width + 1)
-        self._values = deque(values, maxlen=2 * self.width + 1)
-        self.lookup = [
+        values = [minval] * (2 * self._width + 1)
+        self._values = deque(values, maxlen=2 * self._width + 1)
+        self._lookup = [
             [" ", "⢀", "⢠", "⢰", "⢸"],
             ["⡀", "⣀", "⣠", "⣰", "⣸"],
             ["⡄", "⣄", "⣤", "⣴", "⣼"],
@@ -98,28 +104,43 @@ class MemoryGraph:
 
     def _value_to_blocks(self, value: float) -> List[int]:
         dots_per_block = 4
-        if value < self.minval:
+        if value < self._minval:
             n_dots = 0
-        elif value > self.maxval:
-            n_dots = dots_per_block * self.height
+        elif value > self._maxval:
+            n_dots = dots_per_block * self._height
         else:
             n_dots = ceil(
-                (value - self.minval)
-                / (self.maxval - self.minval)
+                (value - self._minval)
+                / (self._maxval - self._minval)
                 * dots_per_block
-                * self.height
+                * self._height
             )
         blocks = [dots_per_block] * (n_dots // dots_per_block)
         if n_dots % dots_per_block > 0:
             blocks += [n_dots % dots_per_block]
-        blocks += [0] * (self.height - len(blocks))
+        blocks += [0] * (self._height - len(blocks))
         return blocks
 
     def add_value(self, value: float) -> None:
+        if value > self._maxval:
+            self._reset_max(value)
+        self._add_value_without_redraw(value)
+        self.refresh()
+
+    def _reset_max(self, value: float) -> None:
+        log(f"updating max val from {self._maxval} to {value}")
+        self._graph = [deque(maxlen=self._width) for _ in range(self._height)]
+        self._maxval = value
+        for old_val in list(self._values):
+            self._add_value_without_redraw(old_val)
+        log(f"done updating max val to {value}")
+
+    def _add_value_without_redraw(self, value: float) -> None:
         blocks = self._value_to_blocks(value)
+        log(f"blocks for new value {value}: {blocks}")
 
         chars = reversed(
-            tuple(self.lookup[i0][i1] for i0, i1 in zip(self._previous_blocks, blocks))
+            tuple(self._lookup[i0][i1] for i0, i1 in zip(self._previous_blocks, blocks))
         )
 
         for row, char in enumerate(chars):
@@ -128,15 +149,16 @@ class MemoryGraph:
         self._values.append(value)
         self._previous_blocks = blocks
 
-    def reset_max(self, value: float) -> None:
-        self._graph = [deque(maxlen=self.width) for _ in range(self.height)]
-        self.maxval = value
-        for value in self._values.copy():
-            self.add_value(value)
-
-    @property
-    def graph(self) -> Tuple[str, ...]:
-        return tuple("".join(chars) for chars in self._graph)
+    def render_line(self, y: int) -> Strip:
+        if y > len(self._graph):
+            return Strip.blank(self.size.width)
+        log(f"Rendering line with width {self.size.width}")
+        data = " " * self.size.width
+        data += "".join(self._graph[y])
+        data = data[-self.size.width :]
+        log(f"Returning {data!r} with len {len(data)}")
+        log(f"Data in graph was {self._graph[y]!r} with len {len(self._graph[y])}")
+        return Strip([Segment(data, self.rich_style)])
 
 
 @total_ordering
@@ -391,6 +413,9 @@ class Header(Widget):
         self.command_line = escape(cmd_line)
 
     def compose(self) -> ComposeResult:
+        memory_graph = MemoryGraph(max_data_points=50)
+        memory_graph.border_title = "Heap Usage"
+
         yield Container(
             Label("\n(∩｀-´)⊃━☆ﾟ.*･｡ﾟ\n"),
             Container(
@@ -408,7 +433,7 @@ class Header(Widget):
                 ),
                 id="header_metadata",
             ),
-            Static(id="panel"),
+            memory_graph,
             id="header_container",
         )
 
@@ -485,7 +510,6 @@ class TUI(Screen):
     # to display. This avoids "Thread 1 of 0" and fixes a DivideByZeroError
     # when switching threads before the first allocation is seen.
     _DUMMY_THREAD_LIST = [0]
-    stream = MemoryGraph(50, 4, 0.0, 1024.0)
 
     thread_idx = reactive(0)
     threads = reactive(_DUMMY_THREAD_LIST, always_update=True)
@@ -585,6 +609,7 @@ class TUI(Screen):
         header = self.query_one(Header)
         heap = self.query_one(HeapSize)
         body = self.query_one(Table)
+        graph = self.query_one(MemoryGraph)
 
         # We want to update many header fields even when paused
         header.n_samples += 1
@@ -593,18 +618,7 @@ class TUI(Screen):
         heap.current_memory_size = snapshot.heap_size
         if snapshot.heap_size > heap.max_memory_seen:
             heap.max_memory_seen = snapshot.heap_size
-            self.stream.reset_max(heap.max_memory_seen)
-        self.stream.add_value(snapshot.heap_size)
-
-        self.query_one("#panel", Static).update(
-            Panel(
-                "\n".join(self.stream.graph),
-                title="Memory",
-                title_align="left",
-                border_style="green",
-                expand=False,
-            )
-        )
+        graph.add_value(snapshot.heap_size)
 
         # Other fields should only be updated when not paused.
         if self.paused:
@@ -681,15 +695,16 @@ class TUIApp(App):
     CSS_PATH = "tui.css"
 
     def __init__(self, reader: SocketReader):
+        self._update_thread = None
         self._reader = reader
         self.active = True
         super().__init__()
 
     def on_mount(self):
-        self.update_thread = UpdateThread(self, self._reader)
-        self.update_thread.start()
+        self._update_thread = UpdateThread(self, self._reader)
+        self._update_thread.start()
 
-        self.set_interval(1, self.update_thread.schedule_update)
+        self.set_interval(1, self._update_thread.schedule_update)
         self.push_screen(
             TUI(
                 pid=self._reader.pid,
@@ -700,9 +715,10 @@ class TUIApp(App):
         log(self.namespace_bindings)
 
     def on_unmount(self):
-        self.update_thread.cancel()
-        self.update_thread.join()
-        log("TUI update thread gracefully stopped")
+        if self._update_thread:
+            self._update_thread.cancel()
+            self._update_thread.join()
+            log("TUI update thread gracefully stopped")
 
     def on_snapshot_fetched(self, message: SnapshotFetched) -> None:
         """Method called to process each fetched snapshot."""
