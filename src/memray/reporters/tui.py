@@ -1,3 +1,7 @@
+import contextlib
+import os
+import pathlib
+import sys
 import threading
 from collections import defaultdict
 from collections import deque
@@ -14,10 +18,16 @@ from typing import Optional
 from typing import Set
 from typing import Tuple
 
+from rich.console import Console
+from rich.console import ConsoleOptions
+from rich.console import RenderResult
 from rich.markup import escape
-from rich.progress_bar import ProgressBar
+from rich.measure import Measurement
+from rich.bar import Bar
 from rich.segment import Segment
+from rich.style import Style
 from rich.text import Text
+from textual import events
 from textual import log
 from textual.app import App
 from textual.app import ComposeResult
@@ -260,7 +270,51 @@ class TimeDisplay(Static):
         self.set_interval(0.1, lambda: self.update(datetime.now().ctime()))
 
 
-class Table(Widget):
+def _filename_to_module_name(file: str) -> str:
+    if file.endswith(".py"):
+        for path in sys.path:
+            with contextlib.suppress(ValueError):
+                relative_path = pathlib.Path(file).relative_to(path)
+                ret = str(relative_path.with_suffix(""))
+                ret = ret.replace(os.sep, ".").replace(".__init__", "")
+                return ret
+    return file
+
+
+class LocationText:
+    def __init__(self, function: str, file: str) -> None:
+        self.function = function
+        self.file = _filename_to_module_name(file)
+        self.file_basename = os.path.basename(file)
+        self.max_width = len(self.function) + len(" in ") + len(self.file)
+        self.med_width = len(self.function) + len(" in ") + len(self.file_basename)
+
+    def __rich_console__(
+        self, console: Console, options: ConsoleOptions
+    ) -> RenderResult:
+        log(f"{self.function} width={console.width} min_width={options.min_width} max_width={options.max_width}")
+        yield Segment(self.function, Style(color="magenta", bold=True))
+        if options.max_width >= self.max_width:
+            yield Segment(" in ")
+            yield Segment(self.file, Style(color="cyan"))
+            log("max verbose")
+        elif options.max_width >= self.med_width:
+            yield Segment(" in ")
+            yield Segment(self.file_basename, Style(color="cyan"))
+            log("med verbose")
+        else:
+            log("min verbose")
+
+
+    def __rich_measure__(
+        self, console: Console, options: ConsoleOptions
+    ) -> Measurement:
+        min_size = len(self.function)
+        max_size = len(self.function) + len(" in ") + len(self.file)
+        return Measurement(min_size, max_size)
+
+
+class AllocationTable(Widget):
     """Widget to display the TUI table."""
 
     default_sort_column_id = 1
@@ -292,11 +346,33 @@ class Table(Widget):
     def compose(self) -> ComposeResult:
         table = DataTable(id="body_table", header_height=2, show_cursor=False)
         for column_idx in range(len(self.columns)):
-            if column_idx == self.default_sort_column_id:
-                table.add_column(f"<{self.columns[column_idx]}>", key=str(column_idx))
+            if column_idx == 0:
+                table.add_column(
+                    self.columns[column_idx], key=str(column_idx)
+                )
+            elif column_idx == self.default_sort_column_id:
+                table.add_column(f"<{self.columns[column_idx]}>", key=str(column_idx), width=11)
             else:
-                table.add_column(self.columns[column_idx], key=str(column_idx))
+                table.add_column(self.columns[column_idx], key=str(column_idx), width=11)
         yield table
+
+    def _on_resize(self, event: events.Resize) -> None:
+        # Minimum size for the location column is 30.
+        # Maximum size is 33% of the screen.
+        loc_size = max(30, event.size.width // 3)
+        table = self.query_one("#body_table", DataTable)
+        table.clear(columns=True)
+        for column_idx in range(len(self.columns)):
+            if column_idx == 0:
+                table.add_column(
+                    self.columns[column_idx], key=str(column_idx), width=loc_size,
+                )
+            elif column_idx == self.default_sort_column_id:
+                table.add_column(f"<{self.columns[column_idx]}>", key=str(column_idx), width=11)
+            else:
+                table.add_column(self.columns[column_idx], key=str(column_idx), width=11)
+        self.populate_table()
+        table.refresh_column(0)
 
     def watch_current_thread(self) -> None:
         """Called when the current_thread attribute changes."""
@@ -370,7 +446,9 @@ class Table(Widget):
             row_key = color_location
             new_locations.add(RowKey(row_key))
             if row_key not in table.rows:
-                table.add_row(color_location, *cells, key=row_key)
+                table.add_row(
+                    LocationText(location.function, location.file), *cells, key=row_key
+                )
             else:
                 for col_idx, val in enumerate(cells, 1):
                     col_key = str(col_idx)
@@ -422,7 +500,7 @@ class Header(Widget):
                 id="header_metadata",
             ),
             Container(
-            memory_graph,
+                memory_graph,
             ),
             id="header_container",
         )
@@ -441,6 +519,16 @@ class Header(Widget):
 class HeapSize(Widget):
     """Widget to display TUI heap-size information."""
 
+    COMPONENT_CLASSES = {
+        "heapsize--meter",
+    }
+
+    DEFAULT_CSS = """
+    HeapSize .heapsize--meter {
+        color: $accent;
+    }
+    """
+
     current_memory_size = reactive(0)
     max_memory_seen = reactive(0)
 
@@ -456,11 +544,18 @@ class HeapSize(Widget):
         self, current_memory_size: int, max_memory_seen: int
     ) -> None:
         """Method to update the progress bar."""
+        style = self.get_component_rich_style("heapsize--meter")
+        kwargs = {}
+        if style.color:
+            kwargs["color"] = style.color
+        if style.bgcolor:
+            kwargs["bgcolor"] = style.bgcolor
         self.query_one("#progress_bar", Static).update(
-            ProgressBar(
-                completed=current_memory_size,
-                total=max_memory_seen + 1,
-                complete_style="blue",
+            Bar(
+                size=max_memory_seen,
+                begin=0,
+                end=current_memory_size,
+                **kwargs,
             )
         )
 
@@ -551,7 +646,7 @@ class TUI(Screen):
         self.query_one("#thread", Label).update(
             f"[b]Thread[/] {thread_idx + 1} of {len(self.threads)}"
         )
-        self.query_one(Table).current_thread = self.current_thread
+        self.query_one(AllocationTable).current_thread = self.current_thread
 
     def watch_threads(self, threads: List[int]) -> None:
         """Called when the threads attribute changes."""
@@ -587,7 +682,7 @@ class TUI(Screen):
         )
         yield Header(pid=self.pid, cmd_line=escape(self.cmd_line or ""))
         yield HeapSize()
-        yield Table(native=self.native)
+        yield AllocationTable(native=self.native)
         yield Label(id="message")
         yield Footer()
 
@@ -596,7 +691,7 @@ class TUI(Screen):
 
         header = self.query_one(Header)
         heap = self.query_one(HeapSize)
-        body = self.query_one(Table)
+        body = self.query_one(AllocationTable)
         graph = self.query_one(MemoryGraph)
 
         # We want to update many header fields even when paused
@@ -629,7 +724,7 @@ class TUI(Screen):
 
     def update_sort_key(self, col_number: int) -> None:
         """Method called to update the table sort key attribute."""
-        body = self.query_one(Table)
+        body = self.query_one(AllocationTable)
         body.sort_column_id = col_number
 
 

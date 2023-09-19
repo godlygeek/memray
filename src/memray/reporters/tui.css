@@ -66,6 +66,7 @@ HeapSize {
 
 #progress_bar {
     height: 1;
+    width: 100%;
 }
 
 /* Override default footer styling */
@@ -87,6 +88,6 @@ MemoryGraph {
 }
 
 /* Override default table styling */
-Table {
+AllocationTable {
     height: 1fr;
 }
