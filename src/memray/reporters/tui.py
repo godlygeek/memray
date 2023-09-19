@@ -32,6 +32,7 @@ from textual.widgets import DataTable
 from textual.widgets import Footer
 from textual.widgets import Label
 from textual.widgets import Static
+from textual.widgets.data_table import RowKey
 
 from memray import AllocationRecord
 from memray import SocketReader
@@ -87,7 +88,9 @@ class MemoryGraph(Widget):
         minval: float = 0.0
         maxval: float = 1024.0
         self._width = max_data_points
-        self._graph: List[Deque[str]] = [deque(maxlen=self._width) for _ in range(height)]
+        self._graph: List[Deque[str]] = [
+            deque(maxlen=self._width) for _ in range(height)
+        ]
         self._height = height
         self._minval = minval
         self._maxval = maxval
@@ -128,16 +131,13 @@ class MemoryGraph(Widget):
         self.refresh()
 
     def _reset_max(self, value: float) -> None:
-        log(f"updating max val from {self._maxval} to {value}")
         self._graph = [deque(maxlen=self._width) for _ in range(self._height)]
         self._maxval = value
         for old_val in list(self._values):
             self._add_value_without_redraw(old_val)
-        log(f"done updating max val to {value}")
 
     def _add_value_without_redraw(self, value: float) -> None:
         blocks = self._value_to_blocks(value)
-        log(f"blocks for new value {value}: {blocks}")
 
         chars = reversed(
             tuple(self._lookup[i0][i1] for i0, i1 in zip(self._previous_blocks, blocks))
@@ -152,12 +152,9 @@ class MemoryGraph(Widget):
     def render_line(self, y: int) -> Strip:
         if y > len(self._graph):
             return Strip.blank(self.size.width)
-        log(f"Rendering line with width {self.size.width}")
         data = " " * self.size.width
         data += "".join(self._graph[y])
         data = data[-self.size.width :]
-        log(f"Returning {data!r} with len {len(data)}")
-        log(f"Data in graph was {self._graph[y]!r} with len {len(self._graph[y])}")
         return Strip([Segment(data, self.rich_style)])
 
 
@@ -292,11 +289,7 @@ class Table(Widget):
         self._native = native
         self._prev_sort_column_id = 1
 
-    def on_mount(self):
-        log("TUI.on_mount")
-
     def compose(self) -> ComposeResult:
-        log("compose")
         table = DataTable(id="body_table", header_height=2, show_cursor=False)
         for column_idx in range(len(self.columns)):
             if column_idx == self.default_sort_column_id:
@@ -307,12 +300,10 @@ class Table(Widget):
 
     def watch_current_thread(self) -> None:
         """Called when the current_thread attribute changes."""
-        log(f"current_thread updated to {self.current_thread}")
         self.populate_table()
 
     def watch_snapshot(self) -> None:
         """Called when the snapshot attribute changes."""
-        log("watch_snapshot")
         self.populate_table()
 
     def watch_sort_column_id(self, sort_column_id) -> None:
@@ -331,11 +322,9 @@ class Table(Widget):
 
     def populate_table(self) -> None:
         """Method to render the TUI table."""
-        log("populating table")
         table = self.query_one("#body_table", DataTable)
 
         if not table.columns:
-            log("no columns to render")
             return
 
         allocation_entries = self.snapshot.records_by_location
@@ -353,8 +342,6 @@ class Table(Widget):
         new_locations = set()
 
         for location, result in sorted_allocations:
-            new_locations.add(location)
-
             if self.current_thread not in result.thread_ids:
                 continue
             color_location = (
@@ -381,6 +368,7 @@ class Table(Widget):
             ]
 
             row_key = color_location
+            new_locations.add(RowKey(row_key))
             if row_key not in table.rows:
                 table.add_row(color_location, *cells, key=row_key)
             else:
@@ -433,7 +421,9 @@ class Header(Widget):
                 ),
                 id="header_metadata",
             ),
+            Container(
             memory_graph,
+            ),
             id="header_container",
         )
 
@@ -550,8 +540,6 @@ class TUI(Screen):
                 "description",
                 "Unpause" if self.paused else "Pause",
             )
-            log(self.TOGGLE_PAUSE_BINDING)
-            log(self.app.namespace_bindings)
             self.app.query_one(Footer).highlight_key = "space"
             self.app.query_one(Footer).highlight_key = None
             if not self.paused:
@@ -637,7 +625,6 @@ class TUI(Screen):
 
         body.current_thread = self.current_thread
         if not self.paused:
-            log("Updating snapshot!")
             body.snapshot = snapshot
 
     def update_sort_key(self, col_number: int) -> None:
@@ -701,6 +688,7 @@ class TUIApp(App):
         super().__init__()
 
     def on_mount(self):
+        log("mounting app")
         self._update_thread = UpdateThread(self, self._reader)
         self._update_thread.start()
 
@@ -712,21 +700,17 @@ class TUIApp(App):
                 native=self._reader.has_native_traces,
             )
         )
-        log(self.namespace_bindings)
 
     def on_unmount(self):
         if self._update_thread:
             self._update_thread.cancel()
             self._update_thread.join()
-            log("TUI update thread gracefully stopped")
 
     def on_snapshot_fetched(self, message: SnapshotFetched) -> None:
         """Method called to process each fetched snapshot."""
-        log("on snapshot fetched")
         tui = self.query_one(TUI)
         with self.batch_update():
             tui.snapshot = message.snapshot
         if message.disconnected:
             self.active = False
-            log("setting disconnected")
             tui.disconnected = True

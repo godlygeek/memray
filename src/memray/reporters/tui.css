@@ -78,18 +78,15 @@ Footer > .footer--key {
 }
 
 MemoryGraph {
-    overflow: hidden hidden;
     text-align: right;
     border: round $success-lighten-1;
-    width: 100%;
     box-sizing: content-box;
-    max-width: 50;
     height: 4;
-    /*align: right middle;*/
+    max-width: 50;
+    dock: right;
 }
 
 /* Override default table styling */
 Table {
-    border: hkey white;
     height: 1fr;
 }
