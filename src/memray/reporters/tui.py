@@ -140,9 +140,7 @@ class MemoryGraph(Widget):
             self._reset_max(value)
         self._add_value_without_redraw(value)
         if self._maxval > 1:
-            self.border_subtitle = (
-                    f"{size_fmt(int(value))} ({value * 100/self._maxval:.0f}% of max {size_fmt(int(self._maxval))})"
-            )
+            self.border_subtitle = f"{size_fmt(int(value))} ({value * 100/self._maxval:.0f}% of max {size_fmt(int(self._maxval))})"
         self.refresh()
 
     def _reset_max(self, value: float) -> None:
@@ -387,14 +385,12 @@ class AllocationTable(Widget):
             return Text(self.columns[column_idx], justify="right")
 
     def compose(self) -> ComposeResult:
-        table = DataTable(id="body_table", header_height=1, show_cursor=False)
+        table = DataTable(
+            id="body_table", header_height=1, show_cursor=False, zebra_stripes=True
+        )
         for column_idx in range(len(self.columns)):
             if column_idx == 0:
                 table.add_column(self.get_heading(column_idx), key=str(column_idx))
-            elif column_idx == self.default_sort_column_id:
-                table.add_column(
-                    self.get_heading(column_idx), key=str(column_idx), width=11
-                )
             else:
                 table.add_column(
                     self.get_heading(column_idx), key=str(column_idx), width=11
@@ -403,9 +399,9 @@ class AllocationTable(Widget):
         yield table
 
     def _on_resize(self, event: events.Resize) -> None:
-        # Minimum size for the location column is 30.
-        # Maximum size is 33% of the screen.
-        loc_size = max(30, event.size.width // 3)
+        # Minimum size for the location column is 30 cells.
+        # Maximum size is the lesser of 50% of the screen width or 100 cells.
+        loc_size = max(30, min(event.size.width // 2, 100))
         table = self.query_one("#body_table", DataTable)
         table.clear(columns=True)
         for column_idx in range(len(self.columns)):
@@ -414,10 +410,6 @@ class AllocationTable(Widget):
                     self.get_heading(column_idx),
                     key=str(column_idx),
                     width=loc_size,
-                )
-            elif column_idx == self.default_sort_column_id:
-                table.add_column(
-                    self.get_heading(column_idx), key=str(column_idx), width=11
                 )
             else:
                 table.add_column(
@@ -468,10 +460,6 @@ class AllocationTable(Widget):
         for location, result in sorted_allocations:
             if self.current_thread not in result.thread_ids:
                 continue
-            color_location = (
-                f"[bold magenta]{escape(location.function)}[/] at "
-                f"[cyan]{escape(location.file)}[/]"
-            )
             total_color = _size_to_color(result.total_memory / total_allocations)
             own_color = _size_to_color(result.own_memory / total_allocations)
             allocation_color = _size_to_color(result.n_allocations / total_allocations)
@@ -491,7 +479,7 @@ class AllocationTable(Widget):
                 ),
             ]
 
-            row_key = color_location
+            row_key = str((location.function, location.file))
             new_locations.add(RowKey(row_key))
             if row_key not in table.rows:
                 table.add_row(
