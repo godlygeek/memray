@@ -284,41 +284,6 @@ def _filename_to_module_name(file: str) -> str:
     return file
 
 
-class LocationText:
-    def __init__(self, function: str, file: str) -> None:
-        func_seg = Segment(function, Style(color="magenta", bold=True))
-        in_seg = Segment(" in ")
-        module_seg = Segment(_filename_to_module_name(file), Style(color="cyan"))
-        file_seg = Segment(os.path.basename(file), Style(color="cyan"))
-
-        options = [
-            [func_seg],
-            [func_seg, in_seg, file_seg],
-            [func_seg, in_seg, module_seg],
-        ]
-
-        self.ordered_options = [
-            (sum(seg.cell_length for seg in option), option) for option in options
-        ]
-
-        self.ordered_options.sort()
-
-    def __rich_measure__(
-        self, console: Console, options: ConsoleOptions
-    ) -> Measurement:
-        min_size = self.ordered_options[0][0]
-        max_size = self.ordered_options[-1][0]
-        return Measurement(min_size, max_size)
-
-    def __rich_console__(
-        self, console: Console, options: ConsoleOptions
-    ) -> RenderResult:
-        for required_length, segments in reversed(self.ordered_options):
-            if options.max_width >= required_length:
-                return segments
-        return self.ordered_options[0][1]
-
-
 class AllocationTable(Widget):
     """Widget to display the TUI table."""
 
@@ -347,6 +312,7 @@ class AllocationTable(Widget):
         "Own Bytes",
         "% Own",
         "Allocations",
+        "File/Module",
     ]
 
     KEY_TO_COLUMN_NAME = {
@@ -375,7 +341,7 @@ class AllocationTable(Widget):
         log(
             f"{self._composed=} {sort_column=} {highlighted_columns_by_sort_column[sort_column]=}"
         )
-        if column_idx == 0:
+        if column_idx in (0, len(self.columns) - 1):
             return Text(self.columns[column_idx], justify="center")
         elif column_idx in highlighted_columns_by_sort_column[sort_column]:
             return Text(
@@ -389,34 +355,13 @@ class AllocationTable(Widget):
             id="body_table", header_height=1, show_cursor=False, zebra_stripes=True
         )
         for column_idx in range(len(self.columns)):
-            if column_idx == 0:
-                table.add_column(self.get_heading(column_idx), key=str(column_idx))
-            else:
-                table.add_column(
-                    self.get_heading(column_idx), key=str(column_idx), width=11
-                )
+            table.add_column(self.get_heading(column_idx), key=str(column_idx))
+
+        # Set an initial size for the Location column to avoid too many resizes
+        table.ordered_columns[0].content_width = 50
+
         self._composed = True
         yield table
-
-    def _on_resize(self, event: events.Resize) -> None:
-        # Minimum size for the location column is 30 cells.
-        # Maximum size is the lesser of 50% of the screen width or 100 cells.
-        loc_size = max(30, min(event.size.width // 2, 100))
-        table = self.query_one("#body_table", DataTable)
-        table.clear(columns=True)
-        for column_idx in range(len(self.columns)):
-            if column_idx == 0:
-                table.add_column(
-                    self.get_heading(column_idx),
-                    key=str(column_idx),
-                    width=loc_size,
-                )
-            else:
-                table.add_column(
-                    self.get_heading(column_idx), key=str(column_idx), width=11
-                )
-        self.populate_table()
-        table.refresh_column(0)
 
     def watch_current_thread(self) -> None:
         """Called when the current_thread attribute changes."""
@@ -483,7 +428,10 @@ class AllocationTable(Widget):
             new_locations.add(RowKey(row_key))
             if row_key not in table.rows:
                 table.add_row(
-                    LocationText(location.function, location.file), *cells, key=row_key
+                    Text(location.function, style="cyan"),
+                    *cells,
+                    Text(_filename_to_module_name(location.file)),
+                    key=row_key,
                 )
             else:
                 for col_idx, val in enumerate(cells, 1):
