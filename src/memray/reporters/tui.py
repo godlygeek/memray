@@ -1,4 +1,5 @@
 import contextlib
+import dataclasses
 import os
 import pathlib
 import sys
@@ -23,7 +24,6 @@ from rich.console import ConsoleOptions
 from rich.console import RenderResult
 from rich.markup import escape
 from rich.measure import Measurement
-from rich.bar import Bar
 from rich.segment import Segment
 from rich.style import Style
 from rich.text import Text
@@ -33,6 +33,7 @@ from textual.app import App
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Container
+from textual.dom import DOMNode
 from textual.message import Message
 from textual.reactive import reactive
 from textual.screen import Screen
@@ -96,7 +97,7 @@ class MemoryGraph(Widget):
         super().__init__(*args, **kwargs)
         height: int = 4
         minval: float = 0.0
-        maxval: float = 1024.0
+        maxval: float = 1.0
         self._width = max_data_points
         self._graph: List[Deque[str]] = [
             deque(maxlen=self._width) for _ in range(height)
@@ -138,6 +139,10 @@ class MemoryGraph(Widget):
         if value > self._maxval:
             self._reset_max(value)
         self._add_value_without_redraw(value)
+        if self._maxval > 1:
+            self.border_subtitle = (
+                    f"{size_fmt(int(value))} ({value * 100/self._maxval:.0f}% of max {size_fmt(int(self._maxval))})"
+            )
         self.refresh()
 
     def _reset_max(self, value: float) -> None:
@@ -172,9 +177,9 @@ class MemoryGraph(Widget):
 class SortableText(Text):
     __slots__ = ("value",)
 
-    def __init__(self, value, text, style=""):
+    def __init__(self, value, text, style="", justify="right"):
         self.value = value
-        super().__init__(str(text), style)
+        super().__init__(str(text), style, justify=justify)  # type: ignore
 
     def __lt__(self, other):
         if type(other) != SortableText:
@@ -283,39 +288,53 @@ def _filename_to_module_name(file: str) -> str:
 
 class LocationText:
     def __init__(self, function: str, file: str) -> None:
-        self.function = function
-        self.file = _filename_to_module_name(file)
-        self.file_basename = os.path.basename(file)
-        self.max_width = len(self.function) + len(" in ") + len(self.file)
-        self.med_width = len(self.function) + len(" in ") + len(self.file_basename)
+        func_seg = Segment(function, Style(color="magenta", bold=True))
+        in_seg = Segment(" in ")
+        module_seg = Segment(_filename_to_module_name(file), Style(color="cyan"))
+        file_seg = Segment(os.path.basename(file), Style(color="cyan"))
 
-    def __rich_console__(
-        self, console: Console, options: ConsoleOptions
-    ) -> RenderResult:
-        log(f"{self.function} width={console.width} min_width={options.min_width} max_width={options.max_width}")
-        yield Segment(self.function, Style(color="magenta", bold=True))
-        if options.max_width >= self.max_width:
-            yield Segment(" in ")
-            yield Segment(self.file, Style(color="cyan"))
-            log("max verbose")
-        elif options.max_width >= self.med_width:
-            yield Segment(" in ")
-            yield Segment(self.file_basename, Style(color="cyan"))
-            log("med verbose")
-        else:
-            log("min verbose")
+        options = [
+            [func_seg],
+            [func_seg, in_seg, file_seg],
+            [func_seg, in_seg, module_seg],
+        ]
 
+        self.ordered_options = [
+            (sum(seg.cell_length for seg in option), option) for option in options
+        ]
+
+        self.ordered_options.sort()
 
     def __rich_measure__(
         self, console: Console, options: ConsoleOptions
     ) -> Measurement:
-        min_size = len(self.function)
-        max_size = len(self.function) + len(" in ") + len(self.file)
+        min_size = self.ordered_options[0][0]
+        max_size = self.ordered_options[-1][0]
         return Measurement(min_size, max_size)
+
+    def __rich_console__(
+        self, console: Console, options: ConsoleOptions
+    ) -> RenderResult:
+        for required_length, segments in reversed(self.ordered_options):
+            if options.max_width >= required_length:
+                return segments
+        return self.ordered_options[0][1]
 
 
 class AllocationTable(Widget):
     """Widget to display the TUI table."""
+
+    COMPONENT_CLASSES = {
+        "allocationtable--sorted-column-heading",
+    }
+
+    DEFAULT_CSS = """
+    AllocationTable .allocationtable--sorted-column-heading {
+        color: $text;
+        background: $primary;
+        text-style: bold underline;
+    }
+    """
 
     default_sort_column_id = 1
     sort_column_id = reactive(default_sort_column_id)
@@ -325,11 +344,11 @@ class AllocationTable(Widget):
 
     columns = [
         "Location",
-        "Total Memory",
-        "Total Memory %",
-        "Own Memory",
-        "Own Memory % ",
-        "Allocation Count",
+        "Total Bytes",
+        "% Total",
+        "Own Bytes",
+        "% Own",
+        "Allocations",
     ]
 
     KEY_TO_COLUMN_NAME = {
@@ -341,19 +360,46 @@ class AllocationTable(Widget):
     def __init__(self, native: bool):
         super().__init__()
         self._native = native
-        self._prev_sort_column_id = 1
+        self._composed = False
+
+    def get_heading(self, column_idx: int) -> Text:
+        sort_column = (
+            self.sort_column_id if self._composed else self.default_sort_column_id
+        )
+        highlighted_columns_by_sort_column = {
+            1: (1, 2),
+            3: (3, 4),
+            5: (5,),
+        }
+        sort_column_style = self.get_component_rich_style(
+            "allocationtable--sorted-column-heading"
+        )
+        log(
+            f"{self._composed=} {sort_column=} {highlighted_columns_by_sort_column[sort_column]=}"
+        )
+        if column_idx == 0:
+            return Text(self.columns[column_idx], justify="center")
+        elif column_idx in highlighted_columns_by_sort_column[sort_column]:
+            return Text(
+                self.columns[column_idx], justify="right", style=sort_column_style
+            )
+        else:
+            return Text(self.columns[column_idx], justify="right")
 
     def compose(self) -> ComposeResult:
-        table = DataTable(id="body_table", header_height=2, show_cursor=False)
+        table = DataTable(id="body_table", header_height=1, show_cursor=False)
         for column_idx in range(len(self.columns)):
             if column_idx == 0:
-                table.add_column(
-                    self.columns[column_idx], key=str(column_idx)
-                )
+                table.add_column(self.get_heading(column_idx), key=str(column_idx))
             elif column_idx == self.default_sort_column_id:
-                table.add_column(f"<{self.columns[column_idx]}>", key=str(column_idx), width=11)
+                table.add_column(
+                    self.get_heading(column_idx), key=str(column_idx), width=11
+                )
             else:
-                table.add_column(self.columns[column_idx], key=str(column_idx), width=11)
+                table.add_column(
+                    self.get_heading(column_idx), key=str(column_idx), width=11
+                )
+        self._composed = True
         yield table
 
     def _on_resize(self, event: events.Resize) -> None:
@@ -365,12 +411,18 @@ class AllocationTable(Widget):
         for column_idx in range(len(self.columns)):
             if column_idx == 0:
                 table.add_column(
-                    self.columns[column_idx], key=str(column_idx), width=loc_size,
+                    self.get_heading(column_idx),
+                    key=str(column_idx),
+                    width=loc_size,
                 )
             elif column_idx == self.default_sort_column_id:
-                table.add_column(f"<{self.columns[column_idx]}>", key=str(column_idx), width=11)
+                table.add_column(
+                    self.get_heading(column_idx), key=str(column_idx), width=11
+                )
             else:
-                table.add_column(self.columns[column_idx], key=str(column_idx), width=11)
+                table.add_column(
+                    self.get_heading(column_idx), key=str(column_idx), width=11
+                )
         self.populate_table()
         table.refresh_column(0)
 
@@ -382,19 +434,15 @@ class AllocationTable(Widget):
         """Called when the snapshot attribute changes."""
         self.populate_table()
 
-    def watch_sort_column_id(self, sort_column_id) -> None:
+    def watch_sort_column_id(self, sort_column_id: int) -> None:
         """Called when the sort_column_id attribute changes."""
+        log(f"watch_sort_column_id {sort_column_id=}")
         table = self.query_one("#body_table", DataTable)
 
-        if self._prev_sort_column_id != self.sort_column_id:
-            prev_sort_column = table.ordered_columns[self._prev_sort_column_id]
-            prev_sort_column.label = Text(self.columns[self._prev_sort_column_id])
+        for i in range(1, len(self.columns)):
+            table.ordered_columns[i].label = self.get_heading(i)
 
-            sort_column = table.ordered_columns[sort_column_id]
-            sort_column.label = f"<{self.columns[sort_column_id]}>"
-            self._prev_sort_column_id = sort_column_id
-
-            table.sort(sort_column.key, reverse=True)
+        table.sort(table.ordered_columns[sort_column_id].key, reverse=True)
 
     def populate_table(self) -> None:
         """Method to render the TUI table."""
@@ -516,64 +564,6 @@ class Header(Widget):
         )
 
 
-class HeapSize(Widget):
-    """Widget to display TUI heap-size information."""
-
-    COMPONENT_CLASSES = {
-        "heapsize--meter",
-    }
-
-    DEFAULT_CSS = """
-    HeapSize .heapsize--meter {
-        color: $accent;
-    }
-    """
-
-    current_memory_size = reactive(0)
-    max_memory_seen = reactive(0)
-
-    def compose(self) -> ComposeResult:
-        yield Container(
-            Label(id="current_memory_size"),
-            Label(id="max_memory_seen"),
-            id="heap_size",
-        )
-        yield Static(id="progress_bar")
-
-    def update_progress_bar(
-        self, current_memory_size: int, max_memory_seen: int
-    ) -> None:
-        """Method to update the progress bar."""
-        style = self.get_component_rich_style("heapsize--meter")
-        kwargs = {}
-        if style.color:
-            kwargs["color"] = style.color
-        if style.bgcolor:
-            kwargs["bgcolor"] = style.bgcolor
-        self.query_one("#progress_bar", Static).update(
-            Bar(
-                size=max_memory_seen,
-                begin=0,
-                end=current_memory_size,
-                **kwargs,
-            )
-        )
-
-    def watch_current_memory_size(self, current_memory_size: int) -> None:
-        """Called when the current_memory_size attribute changes."""
-        self.query_one("#current_memory_size", Label).update(
-            f"[bold]Current heap size[/]: {size_fmt(current_memory_size)}"
-        )
-        self.update_progress_bar(current_memory_size, self.max_memory_seen)
-
-    def watch_max_memory_seen(self, max_memory_seen: int) -> None:
-        """Called when the max_memory_seen attribute changes."""
-        self.query_one("#max_memory_seen", Label).update(
-            f"[bold]Max heap size seen[/]: {size_fmt(max_memory_seen)}"
-        )
-        self.update_progress_bar(self.current_memory_size, max_memory_seen)
-
-
 class TUI(Screen):
     """TUI main application class."""
 
@@ -681,7 +671,6 @@ class TUI(Screen):
             id="head",
         )
         yield Header(pid=self.pid, cmd_line=escape(self.cmd_line or ""))
-        yield HeapSize()
         yield AllocationTable(native=self.native)
         yield Label(id="message")
         yield Footer()
@@ -690,7 +679,6 @@ class TUI(Screen):
         snapshot = self._latest_snapshot
 
         header = self.query_one(Header)
-        heap = self.query_one(HeapSize)
         body = self.query_one(AllocationTable)
         graph = self.query_one(MemoryGraph)
 
@@ -698,9 +686,6 @@ class TUI(Screen):
         header.n_samples += 1
         header.last_update = datetime.now()
 
-        heap.current_memory_size = snapshot.heap_size
-        if snapshot.heap_size > heap.max_memory_seen:
-            heap.max_memory_seen = snapshot.heap_size
         graph.add_value(snapshot.heap_size)
 
         # Other fields should only be updated when not paused.
@@ -809,3 +794,20 @@ class TUIApp(App):
         if message.disconnected:
             self.active = False
             tui.disconnected = True
+
+    @property
+    def namespace_bindings(self) -> Dict[str, Tuple[DOMNode, Binding]]:
+        bindings = super().namespace_bindings
+
+        if (
+            self.query_one(TUI).paused
+            and "space" in bindings
+            and bindings["space"][1].description == "Pause"
+        ):
+            node, binding = bindings["space"]
+            bindings["space"] = (
+                node,
+                dataclasses.replace(binding, description="Unpause"),
+            )
+
+        return bindings

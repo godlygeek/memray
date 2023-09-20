@@ -46,29 +46,6 @@ Header {
     margin-left: 5;
 }
 
-/* Heap size */
-HeapSize {
-    height: 2;
-}
-
-#heap_size {
-    layout: horizontal;
-}
-
-#current_memory_size {
-    width: 30%;
-}
-
-#max_memory_seen {
-    width: 70%;
-    text-align: right;
-}
-
-#progress_bar {
-    height: 1;
-    width: 100%;
-}
-
 /* Override default footer styling */
 Footer {
     background: transparent;
