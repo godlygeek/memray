@@ -19,19 +19,16 @@ from typing import Optional
 from typing import Set
 from typing import Tuple
 
-from rich.console import Console
-from rich.console import ConsoleOptions
-from rich.console import RenderResult
 from rich.markup import escape
-from rich.measure import Measurement
 from rich.segment import Segment
 from rich.style import Style
 from rich.text import Text
-from textual import events
 from textual import log
 from textual.app import App
 from textual.app import ComposeResult
 from textual.binding import Binding
+from textual.color import Color
+from textual.color import Gradient
 from textual.containers import Container
 from textual.dom import DOMNode
 from textual.message import Message
@@ -140,7 +137,11 @@ class MemoryGraph(Widget):
             self._reset_max(value)
         self._add_value_without_redraw(value)
         if self._maxval > 1:
-            self.border_subtitle = f"{size_fmt(int(value))} ({value * 100/self._maxval:.0f}% of max {size_fmt(int(self._maxval))})"
+            self.border_subtitle = (
+                f"{size_fmt(int(value))}"
+                f" ({int(round(value * 100/self._maxval, 0))}%"
+                f" of {size_fmt(int(self._maxval))} max)"
+            )
         self.refresh()
 
     def _reset_max(self, value: float) -> None:
@@ -175,9 +176,9 @@ class MemoryGraph(Widget):
 class SortableText(Text):
     __slots__ = ("value",)
 
-    def __init__(self, value, text, style="", justify="right"):
+    def __init__(self, value, text, color: Color, justify="right"):
         self.value = value
-        super().__init__(str(text), style, justify=justify)  # type: ignore
+        super().__init__(str(text), Style(color=color.rich_color), justify=justify)  # type: ignore
 
     def __lt__(self, other):
         if type(other) != SortableText:
@@ -193,17 +194,6 @@ class SortableText(Text):
         if type(other) != SortableText:
             return NotImplemented
         return self.value == other.value
-
-
-def _size_to_color(proportion_of_total: float) -> str:
-    if proportion_of_total > 0.6:
-        return "red"
-    elif proportion_of_total > 0.2:
-        return "yellow"
-    elif proportion_of_total > 0.05:
-        return "green"
-    else:
-        return "bright_green"
 
 
 def aggregate_allocations(
@@ -326,6 +316,19 @@ class AllocationTable(Widget):
         self._native = native
         self._composed = False
 
+        gradient = Gradient(
+            (0, Color.parse("limegreen")),
+            (0.05, Color.parse("limegreen")),
+            (0.051, Color(97, 193, 44)),
+            (0.4, Color.parse("goldenrod")),
+            (0.6, Color.parse("darkorange")),
+            (1, Color.parse("indianred")),
+        )
+        self._color_by_percentage = {i: gradient.get_color(i / 100) for i in range(101)}
+
+    def _get_color(self, value: float, max: float) -> Color:
+        return self._color_by_percentage[int(value * 100 / max)]
+
     def get_heading(self, column_idx: int) -> Text:
         sort_column = (
             self.sort_column_id if self._composed else self.default_sort_column_id
@@ -381,6 +384,16 @@ class AllocationTable(Widget):
 
         table.sort(table.ordered_columns[sort_column_id].key, reverse=True)
 
+    @staticmethod
+    def _percent_to_style(
+        proportion: float, style_by_threshold: Iterable[Tuple[float, Style]]
+    ) -> Style:
+        style = Style()
+        for threshold, style in style_by_threshold:
+            if proportion > threshold:
+                return style
+        return style
+
     def populate_table(self) -> None:
         """Method to render the TUI table."""
         table = self.query_one("#body_table", DataTable)
@@ -390,6 +403,9 @@ class AllocationTable(Widget):
 
         allocation_entries = self.snapshot.records_by_location
         total_allocations = self.snapshot.heap_size
+        num_allocations = sum(
+            entry.n_allocations for entry in allocation_entries.values()
+        )
         sorted_allocations = sorted(
             allocation_entries.items(),
             key=lambda item: getattr(  # type: ignore[no-any-return]
@@ -405,9 +421,10 @@ class AllocationTable(Widget):
         for location, result in sorted_allocations:
             if self.current_thread not in result.thread_ids:
                 continue
-            total_color = _size_to_color(result.total_memory / total_allocations)
-            own_color = _size_to_color(result.own_memory / total_allocations)
-            allocation_color = _size_to_color(result.n_allocations / total_allocations)
+
+            total_color = self._get_color(result.total_memory, total_allocations)
+            own_color = self._get_color(result.own_memory, total_allocations)
+            allocation_color = self._get_color(result.n_allocations, num_allocations)
 
             percent_total = result.total_memory / total_allocations * 100
             percent_own = result.own_memory / total_allocations * 100
@@ -533,7 +550,6 @@ class TUI(Screen):
         self.pid, self.cmd_line, self.native = pid, cmd_line, native
         self._seen_threads: Set[int] = set()
         self._max_memory_seen = 0
-
         super().__init__()
 
     @property
@@ -701,6 +717,7 @@ class TUIApp(App):
         self._update_thread = None
         self._reader = reader
         self.active = True
+        self.tui = None
         super().__init__()
 
     def on_mount(self):
@@ -709,13 +726,12 @@ class TUIApp(App):
         self._update_thread.start()
 
         self.set_interval(1, self._update_thread.schedule_update)
-        self.push_screen(
-            TUI(
-                pid=self._reader.pid,
-                cmd_line=self._reader.command_line,
-                native=self._reader.has_native_traces,
-            )
+        self.tui = TUI(
+            pid=self._reader.pid,
+            cmd_line=self._reader.command_line,
+            native=self._reader.has_native_traces,
         )
+        self.push_screen(self.tui)
 
     def on_unmount(self):
         if self._update_thread:
@@ -724,21 +740,22 @@ class TUIApp(App):
 
     def on_snapshot_fetched(self, message: SnapshotFetched) -> None:
         """Method called to process each fetched snapshot."""
-        tui = self.query_one(TUI)
+        assert self.tui is not None
         with self.batch_update():
-            tui.snapshot = message.snapshot
+            self.tui.snapshot = message.snapshot
         if message.disconnected:
             self.active = False
-            tui.disconnected = True
+            self.tui.disconnected = True
 
     @property
     def namespace_bindings(self) -> Dict[str, Tuple[DOMNode, Binding]]:
         bindings = super().namespace_bindings
 
         if (
-            self.query_one(TUI).paused
-            and "space" in bindings
+            "space" in bindings
             and bindings["space"][1].description == "Pause"
+            and self.tui
+            and self.tui.paused
         ):
             node, binding = bindings["space"]
             bindings["space"] = (
