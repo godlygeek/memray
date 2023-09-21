@@ -317,10 +317,8 @@ class AllocationTable(Widget):
         self._composed = False
 
         gradient = Gradient(
-            (0, Color.parse("limegreen")),
-            (0.05, Color.parse("limegreen")),
-            (0.051, Color(97, 193, 44)),
-            (0.4, Color.parse("goldenrod")),
+            (0, Color(97, 193, 44)),
+            (0.4, Color(236, 152, 16)),
             (0.6, Color.parse("darkorange")),
             (1, Color.parse("indianred")),
         )
