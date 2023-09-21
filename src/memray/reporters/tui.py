@@ -279,6 +279,7 @@ class AllocationTable(Widget):
 
     COMPONENT_CLASSES = {
         "allocationtable--sorted-column-heading",
+        "allocationtable--function-name",
     }
 
     DEFAULT_CSS = """
@@ -286,6 +287,10 @@ class AllocationTable(Widget):
         color: $text;
         background: $primary;
         text-style: bold underline;
+    }
+
+    AllocationTable .allocationtable--function-name {
+        color: $accent-lighten-1;
     }
     """
 
@@ -412,6 +417,10 @@ class AllocationTable(Widget):
             reverse=True,
         )
 
+        function_column_style = self.get_component_rich_style(
+            "allocationtable--function-name", partial=True
+        )
+
         # Clear previous table rows
         old_locations = set(table.rows)
         new_locations = set()
@@ -441,9 +450,10 @@ class AllocationTable(Widget):
 
             row_key = str((location.function, location.file))
             new_locations.add(RowKey(row_key))
+
             if row_key not in table.rows:
                 table.add_row(
-                    Text(location.function, style="cyan"),
+                    Text(location.function, style=function_column_style),
                     *cells,
                     Text(_filename_to_module_name(location.file)),
                     key=row_key,
