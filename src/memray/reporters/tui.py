@@ -728,9 +728,12 @@ class TUIApp(App):
 
     CSS_PATH = "tui.css"
 
-    def __init__(self, reader: SocketReader):
+    def __init__(
+        self, reader: SocketReader, cmdline_override: Optional[str] = None
+    ) -> None:
         self._update_thread = None
         self._reader = reader
+        self._cmdline_override = cmdline_override
         self.active = True
         self.tui = None
         super().__init__()
@@ -741,9 +744,14 @@ class TUIApp(App):
         self._update_thread.start()
 
         self.set_interval(1, self._update_thread.schedule_update)
+        cmd_line = (
+            self._cmdline_override
+            if self._cmdline_override is not None
+            else self._reader.command_line
+        )
         self.tui = TUI(
             pid=self._reader.pid,
-            cmd_line=self._reader.command_line,
+            cmd_line=cmd_line,
             native=self._reader.has_native_traces,
         )
         self.push_screen(self.tui)
