@@ -284,13 +284,10 @@ class AllocationTable(Widget):
 
     DEFAULT_CSS = """
     AllocationTable .allocationtable--sorted-column-heading {
-        color: $text;
-        background: $primary;
         text-style: bold underline;
     }
 
     AllocationTable .allocationtable--function-name {
-        color: $accent-lighten-1;
     }
     """
 
@@ -316,6 +313,18 @@ class AllocationTable(Widget):
         5: "n_allocations",
     }
 
+    HIGHLIGHTED_COLUMNS_BY_SORT_COLUMN = {
+        1: (1, 2),
+        3: (3, 4),
+        5: (5,),
+    }
+
+    SORT_COLUMN_BY_CLICKED_COLUMN = {
+        clicked_col: sort_col
+        for sort_col, clicked_cols in HIGHLIGHTED_COLUMNS_BY_SORT_COLUMN.items()
+        for clicked_col in clicked_cols
+    }
+
     def __init__(self, native: bool):
         super().__init__()
         self._native = native
@@ -336,25 +345,23 @@ class AllocationTable(Widget):
         sort_column = (
             self.sort_column_id if self._composed else self.default_sort_column_id
         )
-        highlighted_columns_by_sort_column = {
-            1: (1, 2),
-            3: (3, 4),
-            5: (5,),
-        }
         sort_column_style = self.get_component_rich_style(
-            "allocationtable--sorted-column-heading"
+            "allocationtable--sorted-column-heading",
+            partial=True,
         )
         log(
-            f"{self._composed=} {sort_column=} {highlighted_columns_by_sort_column[sort_column]=}"
+            f"{self._composed=} {sort_column=} {self.HIGHLIGHTED_COLUMNS_BY_SORT_COLUMN[sort_column]=}"
         )
         if column_idx in (0, len(self.columns) - 1):
             return Text(self.columns[column_idx], justify="center")
-        elif column_idx in highlighted_columns_by_sort_column[sort_column]:
+        elif column_idx in self.HIGHLIGHTED_COLUMNS_BY_SORT_COLUMN[sort_column]:
             return Text(
                 self.columns[column_idx], justify="right", style=sort_column_style
             )
         else:
-            return Text(self.columns[column_idx], justify="right")
+            return Text(self.columns[column_idx], justify="right").on(
+                click=f"screen.sort({self.SORT_COLUMN_BY_CLICKED_COLUMN[column_idx]})"
+            )
 
     def compose(self) -> ComposeResult:
         table = DataTable(
