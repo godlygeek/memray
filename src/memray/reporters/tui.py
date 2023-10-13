@@ -23,6 +23,7 @@ from rich.markup import escape
 from rich.segment import Segment
 from rich.style import Style
 from rich.text import Text
+from textual import events
 from textual import log
 from textual.app import App
 from textual.app import ComposeResult
@@ -30,6 +31,7 @@ from textual.binding import Binding
 from textual.color import Color
 from textual.color import Gradient
 from textual.containers import Container
+from textual.containers import HorizontalScroll
 from textual.dom import DOMNode
 from textual.message import Message
 from textual.reactive import reactive
@@ -112,6 +114,7 @@ class MemoryGraph(Widget):
             ["⡆", "⣆", "⣦", "⣶", "⣾"],
             ["⡇", "⣇", "⣧", "⣷", "⣿"],
         ]
+        self.border_title = "Heap Usage"
 
     def _value_to_blocks(self, value: float) -> List[int]:
         dots_per_block = 4
@@ -178,7 +181,11 @@ class SortableText(Text):
 
     def __init__(self, value, text, color: Color, justify="right"):
         self.value = value
-        super().__init__(str(text), Style(color=color.rich_color), justify=justify)  # type: ignore
+        super().__init__(
+            str(text),
+            Style(color=color.rich_color),
+            justify=justify,  # type: ignore
+        )
 
     def __lt__(self, other):
         if type(other) != SortableText:
@@ -239,7 +246,7 @@ def aggregate_allocations(
         )
 
         # Walk upwards and sum totals
-        visited = set()
+        visited = set([location])
         for function, file_name, _ in caller_frames:
             location = Location(function=function, file=file_name)
             frame = processed_allocations[location]
@@ -325,9 +332,8 @@ class AllocationTable(Widget):
         for clicked_col in clicked_cols
     }
 
-    def __init__(self, native: bool):
+    def __init__(self):
         super().__init__()
-        self._native = native
         self._composed = False
 
         gradient = Gradient(
@@ -350,7 +356,8 @@ class AllocationTable(Widget):
             partial=True,
         )
         log(
-            f"{self._composed=} {sort_column=} {self.HIGHLIGHTED_COLUMNS_BY_SORT_COLUMN[sort_column]=}"
+            f"{self._composed=} {sort_column=}"
+            f" {self.HIGHLIGHTED_COLUMNS_BY_SORT_COLUMN[sort_column]=}"
         )
         if column_idx in (0, len(self.columns) - 1):
             return Text(self.columns[column_idx], justify="center")
@@ -367,6 +374,7 @@ class AllocationTable(Widget):
         table = DataTable(
             id="body_table", header_height=1, show_cursor=False, zebra_stripes=True
         )
+        table.focus()
         for column_idx in range(len(self.columns)):
             table.add_column(self.get_heading(column_idx), key=str(column_idx))
 
@@ -386,7 +394,6 @@ class AllocationTable(Widget):
 
     def watch_sort_column_id(self, sort_column_id: int) -> None:
         """Called when the sort_column_id attribute changes."""
-        log(f"watch_sort_column_id {sort_column_id=}")
         table = self.query_one("#body_table", DataTable)
 
         for i in range(1, len(self.columns)):
@@ -482,42 +489,37 @@ class Header(Widget):
     pid = reactive("")
     command_line = reactive("")
     n_samples = reactive(0)
-    last_update = reactive(datetime.now())
     start = datetime.now()
+    last_update = reactive(start)
 
     def __init__(self, pid: Optional[int], cmd_line: Optional[str]):
         super().__init__()
         self.pid = pid or "???"
         if not cmd_line:
             cmd_line = "???"
-        if len(cmd_line) > 50:
-            cmd_line = cmd_line[:50] + "..."
         self.command_line = escape(cmd_line)
 
     def compose(self) -> ComposeResult:
-        memory_graph = MemoryGraph(max_data_points=50)
-        memory_graph.border_title = "Heap Usage"
-
+        header_metadata = HorizontalScroll(
+            Container(
+                Label(f"[b]PID[/]: {self.pid}", id="pid"),
+                Label(id="tid"),
+                Label(id="samples"),
+                id="header_metadata_col_1",
+            ),
+            Container(
+                Label(f"[b]CMD[/]: {self.command_line}", shrink=False, id="cmd"),
+                Label(id="thread"),
+                Label(id="duration"),
+                Label(id="message"),
+                id="header_metadata_col_2",
+            ),
+            id="header_metadata",
+        )
+        header_metadata.border_title = "(∩｀-´)⊃━☆ﾟ.*･｡ﾟ"
         yield Container(
-            Label("\n(∩｀-´)⊃━☆ﾟ.*･｡ﾟ\n"),
-            Container(
-                Container(
-                    Label(f"[b]PID[/]: {self.pid}", id="pid"),
-                    Label(id="tid"),
-                    Label(id="samples"),
-                    id="header_metadata_col_1",
-                ),
-                Container(
-                    Label(f"[b]CMD[/]: {self.command_line}", id="cmd"),
-                    Label(id="thread"),
-                    Label(id="duration"),
-                    id="header_metadata_col_2",
-                ),
-                id="header_metadata",
-            ),
-            Container(
-                memory_graph,
-            ),
+            header_metadata,
+            Container(MemoryGraph(max_data_points=50), id="memory_graph_container"),
             id="header_container",
         )
 
@@ -537,8 +539,6 @@ class TUI(Screen):
 
     CSS_PATH = "tui.css"
 
-    TOGGLE_PAUSE_BINDING = Binding("space", "toggle_pause", "Pause")
-
     BINDINGS = [
         Binding("q,esc", "quit", "Quit"),
         Binding("<,left", "previous_thread", "Previous Thread"),
@@ -546,7 +546,9 @@ class TUI(Screen):
         Binding("t", "sort(1)", "Sort by Total"),
         Binding("o", "sort(3)", "Sort by Own"),
         Binding("a", "sort(5)", "Sort by Allocations"),
-        TOGGLE_PAUSE_BINDING,
+        Binding("space", "toggle_pause", "Pause"),
+        Binding("up", "scroll_grid('up')"),
+        Binding("down", "scroll_grid('down')"),
     ]
 
     # Start with a non-empty list of threads so that we always have something
@@ -562,7 +564,9 @@ class TUI(Screen):
     footer_message = reactive("")
 
     def __init__(self, pid: Optional[int], cmd_line: Optional[str], native: bool):
-        self.pid, self.cmd_line, self.native = pid, cmd_line, native
+        self.pid = pid
+        self.cmd_line = cmd_line
+        self.native = native
         self._seen_threads: Set[int] = set()
         self._max_memory_seen = 0
         super().__init__()
@@ -587,15 +591,15 @@ class TUI(Screen):
         """Toggle pause on keypress"""
         if self.paused or not self.disconnected:
             self.paused = not self.paused
-            object.__setattr__(
-                self.TOGGLE_PAUSE_BINDING,
-                "description",
-                "Unpause" if self.paused else "Pause",
-            )
             self.app.query_one(Footer).highlight_key = "space"
             self.app.query_one(Footer).highlight_key = None
             if not self.paused:
                 self.display_snapshot()
+
+    def action_scroll_grid(self, direction: str) -> None:
+        """Toggle pause on keypress"""
+        grid = self.query_one(DataTable)
+        getattr(grid, f"action_scroll_{direction}")()
 
     def watch_thread_idx(self, thread_idx: int) -> None:
         """Called when the thread_idx attribute changes."""
@@ -614,6 +618,8 @@ class TUI(Screen):
 
     def watch_disconnected(self) -> None:
         self.update_label()
+        self.app.query_one(Footer).highlight_key = "space"
+        self.app.query_one(Footer).highlight_key = None
 
     def watch_paused(self) -> None:
         self.update_label()
@@ -626,9 +632,11 @@ class TUI(Screen):
     def update_label(self) -> None:
         message = []
         if self.paused:
-            message.append("[yellow]Paused[/]")
+            message.append("[yellow]Table updates paused[/]")
         if self.disconnected:
             message.append("[red]Remote has disconnected[/]")
+        if message:
+            message.insert(0, "[b]Status[/]:")
         self.query_one("#message", Label).update(" ".join(message))
 
     def compose(self) -> ComposeResult:
@@ -638,12 +646,14 @@ class TUI(Screen):
             id="head",
         )
         yield Header(pid=self.pid, cmd_line=escape(self.cmd_line or ""))
-        yield AllocationTable(native=self.native)
-        yield Label(id="message")
+        yield AllocationTable()
         yield Footer()
 
     def display_snapshot(self) -> None:
         snapshot = self._latest_snapshot
+
+        if snapshot is _EMPTY_SNAPSHOT:
+            return
 
         header = self.query_one(Header)
         body = self.query_one(AllocationTable)
@@ -685,6 +695,7 @@ class UpdateThread(threading.Thread):
         self._app = app
         self._reader = reader
         self._update_requested = threading.Event()
+        self._update_requested.set()
         self._canceled = threading.Event()
         super().__init__()
 
@@ -731,15 +742,12 @@ class TUIApp(App):
     def __init__(
         self, reader: SocketReader, cmdline_override: Optional[str] = None
     ) -> None:
-        self._update_thread = None
         self._reader = reader
         self._cmdline_override = cmdline_override
-        self.active = True
         self.tui = None
         super().__init__()
 
     def on_mount(self):
-        log("mounting app")
         self._update_thread = UpdateThread(self, self._reader)
         self._update_thread.start()
 
@@ -757,9 +765,9 @@ class TUIApp(App):
         self.push_screen(self.tui)
 
     def on_unmount(self):
-        if self._update_thread:
-            self._update_thread.cancel()
-            self._update_thread.join()
+        assert self._update_thread is not None
+        self._update_thread.cancel()
+        self._update_thread.join()
 
     def on_snapshot_fetched(self, message: SnapshotFetched) -> None:
         """Method called to process each fetched snapshot."""
@@ -767,23 +775,27 @@ class TUIApp(App):
         with self.batch_update():
             self.tui.snapshot = message.snapshot
         if message.disconnected:
-            self.active = False
             self.tui.disconnected = True
+
+    def on_resize(self, event: events.Resize) -> None:
+        self.set_class(0 <= event.size.width < 81, "narrow")
 
     @property
     def namespace_bindings(self) -> Dict[str, Tuple[DOMNode, Binding]]:
-        bindings = super().namespace_bindings
+        bindings = super().namespace_bindings.copy()
 
         if (
             "space" in bindings
             and bindings["space"][1].description == "Pause"
             and self.tui
-            and self.tui.paused
         ):
-            node, binding = bindings["space"]
-            bindings["space"] = (
-                node,
-                dataclasses.replace(binding, description="Unpause"),
-            )
+            if self.tui.paused:
+                node, binding = bindings["space"]
+                bindings["space"] = (
+                    node,
+                    dataclasses.replace(binding, description="Unpause"),
+                )
+            elif self.tui.disconnected:
+                del bindings["space"]
 
         return bindings

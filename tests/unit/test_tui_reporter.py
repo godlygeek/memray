@@ -1,20 +1,364 @@
-import datetime
-from io import StringIO
-from unittest.mock import MagicMock
-from unittest.mock import patch
-
-import pytest
-from rich import print as rprint
-from textual.app import App
+import asyncio
 
 from memray import AllocatorType
-from memray.reporters.tui import TUI
-from memray.reporters.tui import Location
-from memray.reporters.tui import MemoryGraph
-from memray.reporters.tui import aggregate_allocations
 from tests.utils import MockAllocationRecord
 
 
+def test_tui_narrow(snap_compare):
+    async def run_before(pilot) -> None:
+        pilot.app._reader.add_snapshot(
+            [
+                MockAllocationRecord(
+                    tid=1,
+                    address=0x1000000,
+                    size=10,
+                    allocator=AllocatorType.MALLOC,
+                    stack_id=1,
+                    n_allocations=2,
+                    _stack=[],
+                    _hybrid_stack=[],
+                ),
+                MockAllocationRecord(
+                    tid=1,
+                    address=0x1000000,
+                    size=20,
+                    allocator=AllocatorType.MALLOC,
+                    stack_id=1,
+                    n_allocations=1,
+                    _hybrid_stack=[
+                        ("sibling", "fun.c", 16),
+                        ("parent", "fun.py", 8),
+                        ("grandparent", "fun.py", 4),
+                    ],
+                ),
+                MockAllocationRecord(
+                    tid=1,
+                    address=0x1000000,
+                    size=30,
+                    allocator=AllocatorType.MALLOC,
+                    stack_id=2,
+                    n_allocations=1,
+                    _hybrid_stack=[],
+                ),
+            ],
+            is_final=False,
+        )
+        pilot.app._reader.add_snapshot(
+            [
+                MockAllocationRecord(
+                    tid=1,
+                    address=0x1000000,
+                    size=10,
+                    allocator=AllocatorType.MALLOC,
+                    stack_id=1,
+                    n_allocations=2,
+                    _stack=[],
+                    _hybrid_stack=[],
+                ),
+                MockAllocationRecord(
+                    tid=1,
+                    address=0x1000000,
+                    size=20,
+                    allocator=AllocatorType.MALLOC,
+                    stack_id=1,
+                    n_allocations=1,
+                    _hybrid_stack=[
+                        ("sibling", "fun.c", 16),
+                        ("parent", "fun.py", 8),
+                        ("grandparent", "fun.py", 4),
+                    ],
+                ),
+                MockAllocationRecord(
+                    tid=1,
+                    address=0x1000000,
+                    size=30,
+                    allocator=AllocatorType.MALLOC,
+                    stack_id=2,
+                    n_allocations=1,
+                    _hybrid_stack=[],
+                ),
+            ],
+            is_final=False,
+        )
+        pilot.app._reader.add_snapshot(
+            [
+                MockAllocationRecord(
+                    tid=1,
+                    address=0x1000000,
+                    size=10,
+                    allocator=AllocatorType.MALLOC,
+                    stack_id=1,
+                    n_allocations=2,
+                    _stack=[],
+                    _hybrid_stack=[],
+                ),
+                MockAllocationRecord(
+                    tid=1,
+                    address=0x1000000,
+                    size=20,
+                    allocator=AllocatorType.MALLOC,
+                    stack_id=1,
+                    n_allocations=1,
+                    _hybrid_stack=[
+                        ("sibling", "fun.c", 16),
+                        ("parent", "fun.py", 8),
+                        ("grandparent", "fun.py", 4),
+                    ],
+                ),
+                MockAllocationRecord(
+                    tid=1,
+                    address=0x1000000,
+                    size=30,
+                    allocator=AllocatorType.MALLOC,
+                    stack_id=2,
+                    n_allocations=1,
+                    _hybrid_stack=[],
+                ),
+            ],
+            is_final=True,
+        )
+        await asyncio.to_thread(pilot.app._update_thread.join)
+
+    assert snap_compare("mock_tui.py", run_before=run_before)
+
+
+def test_tui_wide(snap_compare):
+    async def run_before(pilot) -> None:
+        pilot.app._reader.add_snapshot(
+            [
+                MockAllocationRecord(
+                    tid=1,
+                    address=0x1000000,
+                    size=10,
+                    allocator=AllocatorType.MALLOC,
+                    stack_id=1,
+                    n_allocations=2,
+                    _stack=[],
+                    _hybrid_stack=[],
+                ),
+                MockAllocationRecord(
+                    tid=1,
+                    address=0x1000000,
+                    size=20,
+                    allocator=AllocatorType.MALLOC,
+                    stack_id=1,
+                    n_allocations=1,
+                    _hybrid_stack=[
+                        ("sibling", "fun.c", 16),
+                        ("parent", "fun.py", 8),
+                        ("grandparent", "fun.py", 4),
+                    ],
+                ),
+                MockAllocationRecord(
+                    tid=1,
+                    address=0x1000000,
+                    size=30,
+                    allocator=AllocatorType.MALLOC,
+                    stack_id=2,
+                    n_allocations=1,
+                    _hybrid_stack=[],
+                ),
+            ],
+            is_final=False,
+        )
+        pilot.app._reader.add_snapshot(
+            [
+                MockAllocationRecord(
+                    tid=1,
+                    address=0x1000000,
+                    size=10,
+                    allocator=AllocatorType.MALLOC,
+                    stack_id=1,
+                    n_allocations=2,
+                    _stack=[],
+                    _hybrid_stack=[],
+                ),
+                MockAllocationRecord(
+                    tid=1,
+                    address=0x1000000,
+                    size=20,
+                    allocator=AllocatorType.MALLOC,
+                    stack_id=1,
+                    n_allocations=1,
+                    _hybrid_stack=[
+                        ("sibling", "fun.c", 16),
+                        ("parent", "fun.py", 8),
+                        ("grandparent", "fun.py", 4),
+                    ],
+                ),
+                MockAllocationRecord(
+                    tid=1,
+                    address=0x1000000,
+                    size=30,
+                    allocator=AllocatorType.MALLOC,
+                    stack_id=2,
+                    n_allocations=1,
+                    _hybrid_stack=[],
+                ),
+            ],
+            is_final=False,
+        )
+        pilot.app._reader.add_snapshot(
+            [
+                MockAllocationRecord(
+                    tid=1,
+                    address=0x1000000,
+                    size=10,
+                    allocator=AllocatorType.MALLOC,
+                    stack_id=1,
+                    n_allocations=2,
+                    _stack=[],
+                    _hybrid_stack=[],
+                ),
+                MockAllocationRecord(
+                    tid=1,
+                    address=0x1000000,
+                    size=20,
+                    allocator=AllocatorType.MALLOC,
+                    stack_id=1,
+                    n_allocations=1,
+                    _hybrid_stack=[
+                        ("sibling", "fun.c", 16),
+                        ("parent", "fun.py", 8),
+                        ("grandparent", "fun.py", 4),
+                    ],
+                ),
+                MockAllocationRecord(
+                    tid=1,
+                    address=0x1000000,
+                    size=30,
+                    allocator=AllocatorType.MALLOC,
+                    stack_id=2,
+                    n_allocations=1,
+                    _hybrid_stack=[],
+                ),
+            ],
+            is_final=True,
+        )
+        await asyncio.to_thread(pilot.app._update_thread.join)
+
+    assert snap_compare("mock_tui.py", run_before=run_before, terminal_size=(120, 40))
+
+
+def test_tui_verywide(snap_compare):
+    async def run_before(pilot) -> None:
+        pilot.app._reader.add_snapshot(
+            [
+                MockAllocationRecord(
+                    tid=1,
+                    address=0x1000000,
+                    size=10,
+                    allocator=AllocatorType.MALLOC,
+                    stack_id=1,
+                    n_allocations=2,
+                    _stack=[],
+                    _hybrid_stack=[],
+                ),
+                MockAllocationRecord(
+                    tid=1,
+                    address=0x1000000,
+                    size=20,
+                    allocator=AllocatorType.MALLOC,
+                    stack_id=1,
+                    n_allocations=1,
+                    _hybrid_stack=[
+                        ("sibling", "fun.c", 16),
+                        ("parent", "fun.py", 8),
+                        ("grandparent", "fun.py", 4),
+                    ],
+                ),
+                MockAllocationRecord(
+                    tid=1,
+                    address=0x1000000,
+                    size=30,
+                    allocator=AllocatorType.MALLOC,
+                    stack_id=2,
+                    n_allocations=1,
+                    _hybrid_stack=[],
+                ),
+            ],
+            is_final=False,
+        )
+        pilot.app._reader.add_snapshot(
+            [
+                MockAllocationRecord(
+                    tid=1,
+                    address=0x1000000,
+                    size=10,
+                    allocator=AllocatorType.MALLOC,
+                    stack_id=1,
+                    n_allocations=2,
+                    _stack=[],
+                    _hybrid_stack=[],
+                ),
+                MockAllocationRecord(
+                    tid=1,
+                    address=0x1000000,
+                    size=20,
+                    allocator=AllocatorType.MALLOC,
+                    stack_id=1,
+                    n_allocations=1,
+                    _hybrid_stack=[
+                        ("sibling", "fun.c", 16),
+                        ("parent", "fun.py", 8),
+                        ("grandparent", "fun.py", 4),
+                    ],
+                ),
+                MockAllocationRecord(
+                    tid=1,
+                    address=0x1000000,
+                    size=30,
+                    allocator=AllocatorType.MALLOC,
+                    stack_id=2,
+                    n_allocations=1,
+                    _hybrid_stack=[],
+                ),
+            ],
+            is_final=False,
+        )
+        pilot.app._reader.add_snapshot(
+            [
+                MockAllocationRecord(
+                    tid=1,
+                    address=0x1000000,
+                    size=10,
+                    allocator=AllocatorType.MALLOC,
+                    stack_id=1,
+                    n_allocations=2,
+                    _stack=[],
+                    _hybrid_stack=[],
+                ),
+                MockAllocationRecord(
+                    tid=1,
+                    address=0x1000000,
+                    size=20,
+                    allocator=AllocatorType.MALLOC,
+                    stack_id=1,
+                    n_allocations=1,
+                    _hybrid_stack=[
+                        ("sibling", "fun.c", 16),
+                        ("parent", "fun.py", 8),
+                        ("grandparent", "fun.py", 4),
+                    ],
+                ),
+                MockAllocationRecord(
+                    tid=1,
+                    address=0x1000000,
+                    size=30,
+                    allocator=AllocatorType.MALLOC,
+                    stack_id=2,
+                    n_allocations=1,
+                    _hybrid_stack=[],
+                ),
+            ],
+            is_final=True,
+        )
+        await asyncio.to_thread(pilot.app._update_thread.join)
+
+    assert snap_compare("mock_tui.py", run_before=run_before, terminal_size=(200, 40))
+
+
+"""
 class FakeDate(MagicMock):
     @classmethod
     def now(cls):
@@ -1295,3 +1639,4 @@ def test_pausing():
     assert tui.display_data.current_memory_size == 2048
     assert tui.live_data.n_samples == 2
     assert tui.live_data.current_memory_size == 2048
+"""
