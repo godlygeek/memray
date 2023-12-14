@@ -1,0 +1,35 @@
+name: ci
+
+on:
+  push:
+
+jobs:
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Fetch upstream manylinux2010 image
+        run: |
+          docker pull quay.io/pypa/manylinux2010_x86_64:latest
+          echo "BASE_IMAGE=$(docker image ls -a --filter=reference=quay.io/pypa/manylinux2010_x86_64:latest --format='{{.ID}}')" >>$GITHUB_ENV
+      - name: Cache Docker layers
+        uses: actions/cache@v3
+        with:
+          path: /tmp/.buildx-cache
+          key: docker-${{ env.BASE_IMAGE }}-${{ hashFiles('.github/workflows/manylinux2010-modern-cpython.dockerfile') }}
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: .github/workflows/manylinux2010-modern-cpython.dockerfile
+          tags: manylinux2010-modern-cpython
+          cache-from: type=local,src=/tmp/.buildx-cache
+          cache-to: type=local,dest=/tmp/.buildx-cache-new,mode=max
+      - name: Move cache
+        run: |
+          # Replace old cache, to prevent a snowball effect on cache misses
+          rm -rf /tmp/.buildx-cache
+          mv /tmp/.buildx-cache-new /tmp/.buildx-cache
