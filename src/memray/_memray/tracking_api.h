@@ -414,11 +414,41 @@ class Tracker
     const bool d_trace_python_allocators;
     linker::SymbolPatcher d_patcher;
     std::unique_ptr<BackgroundThread> d_background_thread;
+
+    // Code object cache key that includes code object address and string pointers
+    struct CodeObjectCacheKey
+    {
+        const void* code_ptr;
+        const char* function_name;
+        const char* filename;
+
+        bool operator==(const CodeObjectCacheKey& other) const
+        {
+            return code_ptr == other.code_ptr && function_name == other.function_name
+                   && filename == other.filename;
+        }
+    };
+
+    struct CodeObjectCacheKeyHash
+    {
+        std::size_t operator()(const CodeObjectCacheKey& key) const
+        {
+            std::size_t h1 = std::hash<const void*>{}(key.code_ptr);
+            std::size_t h2 = std::hash<const char*>{}(key.function_name);
+            std::size_t h3 = std::hash<const char*>{}(key.filename);
+            return h1 ^ (h2 << 1) ^ (h3 << 2);
+        }
+    };
+
+    // Code object cache: maps (PyCodeObject*, function_name_ptr, filename_ptr) to code_object_id
+    std::unordered_map<CodeObjectCacheKey, code_object_id_t, CodeObjectCacheKeyHash> d_code_object_cache;
+    code_object_id_t d_next_code_object_id{1};
     std::unordered_map<uint64_t, std::string> d_cached_thread_names;
 
     // Methods
     static size_t computeMainTidSkip();
     frame_id_t registerFrame(const RawFrame& frame);
+    code_object_id_t registerCodeObject(const void* code_ptr, const CodeObject& code_obj);
 
     void trackAllocationImpl(
             void* ptr,

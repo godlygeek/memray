@@ -32,7 +32,8 @@ def simple_test_file(tmp_path):
         from memray._test import MemoryAllocator
         print("Allocating some memory!")
         allocator = MemoryAllocator()
-        allocator.valloc(1024)
+        allocator.valloc(1024 * 1024 * 10)
+        allocator.free()
         """
     )
     code_file.write_text(program)
@@ -585,6 +586,7 @@ class TestParseSubcommand:
             "FRAME_ID",
             "MEMORY_RECORD",
             "CONTEXT_SWITCH",
+            "CODE_OBJECT",
             "TRAILER",
         ]
 
@@ -642,6 +644,7 @@ class TestParseSubcommand:
             "SEGMENT_HEADER",
             "SEGMENT",
             "AGGREGATED_TRAILER",
+            "CODE_OBJECT",
         ]
 
         with Tracker(
