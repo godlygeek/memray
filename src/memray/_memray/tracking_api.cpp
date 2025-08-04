@@ -230,6 +230,8 @@ PythonStackTracker::emitPendingPushesAndPops()
 
     auto it = d_stack->rbegin();
     for (; it != d_stack->rend(); ++it) {
+        std::cerr << "looking at frame " << std::hex << it->frame
+                  << " with back=" << compat::frameGetBack(it->frame) << std::endl;
         if (it->state == FrameState::NOT_EMITTED) {
             it->raw_frame_record.lineno = PyFrame_GetLineNumber(it->frame);
         } else if (it->state == FrameState::EMITTED_BUT_LINE_NUMBER_MAY_HAVE_CHANGED) {
@@ -350,6 +352,8 @@ PythonStackTracker::pushPythonFrame(PyFrameObject* frame)
 void
 PythonStackTracker::pushLazilyEmittedFrame(const LazilyEmittedFrame& frame)
 {
+    std::cerr << "pushing " << std::hex << frame.frame << std::endl;
+
     // Note: this function does not require the GIL.
     if (d_stack) {
         d_stack->push_back(frame);
@@ -515,6 +519,7 @@ PythonStackTracker::pythonFrameToStack(PyFrameObject* current_frame)
 {
     std::vector<LazilyEmittedFrame> stack;
 
+    std::cerr << "Unwinding stack:" << std::endl;
     while (current_frame) {
         PyCodeObject* code = compat::frameGetCode(current_frame);
 
@@ -532,6 +537,11 @@ PythonStackTracker::pythonFrameToStack(PyFrameObject* current_frame)
         // It doesn't matter to the reader, and is more efficient.
         bool entry = !s_native_tracking_enabled || compat::isEntryFrame(current_frame);
         stack.push_back({current_frame, {function, filename, 0, entry}, FrameState::NOT_EMITTED});
+
+        int line = PyFrame_GetLineNumber(current_frame);
+        std::cerr << std::hex << current_frame << " " << std::dec << filename << "::" << function << " "
+                  << line << " next= " << compat::frameGetBack(current_frame) << std::endl;
+
         current_frame = compat::frameGetBack(current_frame);
     }
 
@@ -1197,8 +1207,6 @@ PyTraceFunction(
 {
     RecursionGuard guard;
     if (!Tracker::isActive()) {
-        std::cerr << "Returning due to no active tracker in thread " << std::hex << pthread_self()
-                  << std::endl;
         return 0;
     }
 
