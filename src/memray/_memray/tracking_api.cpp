@@ -49,6 +49,28 @@ starts_with(const std::string& haystack, const std::string_view& needle)
 }
 #endif
 
+class StopTheWorldGuard
+{
+  public:
+    StopTheWorldGuard()
+    : d_interp(PyGILState_GetThisThreadState()->interp)
+    {
+        memray::compat::stopTheWorld(d_interp);
+    }
+
+    ~StopTheWorldGuard()
+    {
+        memray::compat::startTheWorld(d_interp);
+    }
+
+  private:
+    StopTheWorldGuard(const StopTheWorldGuard&) = delete;
+    StopTheWorldGuard(const StopTheWorldGuard&&) = delete;
+    StopTheWorldGuard& operator=(const StopTheWorldGuard&) = delete;
+
+    PyInterpreterState* d_interp;
+};
+
 }  // namespace
 
 namespace memray::tracking_api {
@@ -144,7 +166,6 @@ class PythonStackTracker
     static PythonStackTracker& getUnsafe();
 
     static std::vector<LazilyEmittedFrame> pythonFrameToStack(PyFrameObject* current_frame);
-    static void recordAllStacks();
     void reloadStackIfTrackerChanged();
 
     void pushLazilyEmittedFrame(const LazilyEmittedFrame& frame);
@@ -270,6 +291,9 @@ PythonStackTracker::reloadStackIfTrackerChanged()
     if (d_tracker_generation == s_tracker_generation) {
         return;
     }
+
+    std::cerr << "Reloading stack in thread " << std::hex << pthread_self() << " ("
+              << d_tracker_generation << " != " << s_tracker_generation << ")" << std::endl;
 
     // If we reach this point, a new Tracker was installed by another thread,
     // which also captured our Python stack. Trust it, ignoring any stack we
@@ -515,11 +539,15 @@ PythonStackTracker::pythonFrameToStack(PyFrameObject* current_frame)
 }
 
 void
-PythonStackTracker::recordAllStacks()
+PythonStackTracker::installProfileHooks()
 {
-    assert(PyGILState_Check());
+    // Install our profile function in all existing threads.
+    compat::setprofileAllThreads(PyTraceFunction, nullptr);
 
-    // Record the current Python stack of every thread
+    // Find and record the Python stack for all existing threads.
+    std::unique_lock<std::mutex> lock(s_mutex);
+    StopTheWorldGuard stop_the_world;
+
     std::unordered_map<PyThreadState*, std::vector<LazilyEmittedFrame>> stack_by_thread;
     for (PyThreadState* tstate =
                  PyInterpreterState_ThreadHead(compat::threadStateGetInterpreter(PyThreadState_Get()));
@@ -537,7 +565,6 @@ PythonStackTracker::recordAllStacks()
         }
     }
 
-    std::unique_lock<std::mutex> lock(s_mutex);
     s_initial_stack_by_thread.swap(stack_by_thread);
 
     // Register that tracking has begun (again?), telling threads to sync their
@@ -545,27 +572,6 @@ PythonStackTracker::recordAllStacks()
     // a thread that's 2 generations behind could grab the new stacks with the
     // previous generation number and immediately think they're out of date.
     s_tracker_generation++;
-}
-
-void
-PythonStackTracker::installProfileHooks()
-{
-    assert(PyGILState_Check());
-
-    // Uninstall any existing profile function in all threads. Do this before
-    // installing ours, since we could lose the GIL if the existing profile arg
-    // has a __del__ that gets called. We must hold the GIL for the entire time
-    // we capture threads' stacks and install our trace function into them, so
-    // their stacks can't change after we've captured them and before we've
-    // installed our profile function that utilizes the captured stacks, and so
-    // they can't start profiling before we capture their stack and miss it.
-    compat::setprofileAllThreads(nullptr, nullptr);
-
-    // Find and record the Python stack for all existing threads.
-    recordAllStacks();
-
-    // Install our profile function in all existing threads.
-    compat::setprofileAllThreads(PyTraceFunction, nullptr);
 }
 
 void
@@ -1191,20 +1197,27 @@ PyTraceFunction(
 {
     RecursionGuard guard;
     if (!Tracker::isActive()) {
+        std::cerr << "Returning due to no active tracker in thread " << std::hex << pthread_self()
+                  << std::endl;
         return 0;
     }
 
     if (frame != PyEval_GetFrame()) {
         // This should only happen for the phony frames produced by Cython
         // extension modules that were compiled with `profile=True`.
+        std::cerr << "Ignoring Cython frame in " << std::hex << pthread_self() << std::endl;
         return 0;
     }
 
     switch (what) {
         case PyTrace_CALL: {
+            std::cerr << "Handling call into frame " << std::hex << frame << " in " << std::hex
+                      << pthread_self() << std::endl;
             return PythonStackTracker::get().pushPythonFrame(frame);
         }
         case PyTrace_RETURN: {
+            std::cerr << "Handling return from frame " << std::hex << frame << " in " << std::hex
+                      << pthread_self() << std::endl;
             PythonStackTracker::get().popPythonFrame();
             break;
         }

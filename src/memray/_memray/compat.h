@@ -4,6 +4,7 @@
 #include <Python.h>
 
 #include "frameobject.h"
+#include <iostream>
 
 namespace memray::compat {
 
@@ -86,6 +87,41 @@ threadStateGetInterpreter(PyThreadState* tstate)
     return PyThreadState_GetInterpreter(tstate);
 #endif
 }
+
+#if PY_VERSION_HEX >= 0x030E0000
+
+extern "C" void
+_PyEval_StopTheWorld(PyInterpreterState*);
+extern "C" void
+_PyEval_StartTheWorld(PyInterpreterState*);
+
+inline void
+stopTheWorld(PyInterpreterState* interp)
+{
+    std::cerr << "Calling StopTheWorld" << std::endl;
+    _PyEval_StopTheWorld(interp);
+}
+
+inline void
+startTheWorld(PyInterpreterState* interp)
+{
+    std::cerr << "Calling StartTheWorld" << std::endl;
+    _PyEval_StartTheWorld(interp);
+}
+
+#else
+
+inline void
+stopTheWorld(PyInterpreterState* interp)
+{
+}
+
+inline void
+startTheWorld(PyInterpreterState* interp)
+{
+}
+
+#endif
 
 void
 setprofileAllThreads(Py_tracefunc func, PyObject* arg);
