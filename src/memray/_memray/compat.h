@@ -100,6 +100,7 @@ stopTheWorld(PyInterpreterState* interp)
 {
     std::cerr << "Calling StopTheWorld" << std::endl;
     _PyEval_StopTheWorld(interp);
+    std::cerr << "the world is stopped" << std::endl;
 }
 
 inline void

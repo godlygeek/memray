@@ -161,6 +161,7 @@ class PythonStackTracker
 
     void installGreenletTraceFunctionIfNeeded();
     void handleGreenletSwitch(PyObject* from, PyObject* to);
+    void dumpStack() const;
 
   private:
     // Fetch the thread-local stack tracker without checking if its stack needs to be reloaded.
@@ -325,6 +326,37 @@ PythonStackTracker::reloadStackIfTrackerChanged()
     for (auto frame_it = correct_stack.rbegin(); frame_it != correct_stack.rend(); ++frame_it) {
         pushLazilyEmittedFrame(*frame_it);
     }
+
+    dumpStack();
+}
+
+void
+PythonStackTracker::dumpStack() const
+{
+    std::cerr << "stack for thread " << std::hex << pthread_self() << " (most recent call last)"
+              << std::endl;
+    std::cerr << "[" << std::endl;
+    if (d_stack) {
+        for (const auto& frame : *d_stack) {
+            std::cerr << "    " << std::hex << frame.frame
+                      << " filename=" << frame.raw_frame_record.filename
+                      << " function=" << frame.raw_frame_record.function_name
+                      << " lineno=" << frame.raw_frame_record.lineno
+                      << " state=" << static_cast<int>(frame.state) << std::endl;
+        }
+    }
+    std::cerr << "]" << std::endl;
+
+    if (d_stack && d_stack->size() >= 2) {
+        auto& prev = (*d_stack)[d_stack->size() - 2];
+        auto& curr = (*d_stack)[d_stack->size() - 1];
+
+        if (0 == strcmp(prev.raw_frame_record.function_name, "malloc")
+            && 0 == strcmp(curr.raw_frame_record.function_name, "malloc"))
+        {
+            __asm__("int3");
+        }
+    }
 }
 
 int
@@ -354,6 +386,12 @@ void
 PythonStackTracker::pushLazilyEmittedFrame(const LazilyEmittedFrame& frame)
 {
     std::cerr << "pushing " << std::hex << frame.frame << std::endl;
+
+    if (d_stack && d_stack->back().frame == frame.frame) {
+        std::cerr << "refusing to push duplicate frame!" << std::endl;
+        abort();
+        return;
+    }
 
     // Note: this function does not require the GIL.
     if (d_stack) {
@@ -1215,6 +1253,7 @@ PyTraceFunction(
 {
     RecursionGuard guard;
     if (!Tracker::isActive()) {
+        std::cerr << "disabled tracker in " << std::hex << pthread_self() << std::endl;
         return 0;
     }
 
@@ -1229,12 +1268,17 @@ PyTraceFunction(
         case PyTrace_CALL: {
             std::cerr << "Handling call into frame " << std::hex << frame << " in " << std::hex
                       << pthread_self() << std::endl;
-            return PythonStackTracker::get().pushPythonFrame(frame);
+            auto& tracker = PythonStackTracker::get();
+            int ret = tracker.pushPythonFrame(frame);
+            tracker.dumpStack();
+            return ret;
         }
         case PyTrace_RETURN: {
             std::cerr << "Handling return from frame " << std::hex << frame << " in " << std::hex
                       << pthread_self() << std::endl;
-            PythonStackTracker::get().popPythonFrame();
+            auto& tracker = PythonStackTracker::get();
+            tracker.popPythonFrame();
+            tracker.dumpStack();
             break;
         }
         default:
