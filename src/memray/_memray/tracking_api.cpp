@@ -148,6 +148,7 @@ class PythonStackTracker
     static bool s_native_tracking_enabled;
 
     static void installProfileHooks();
+    static void captureBackgroundThreadStacks();
     static void removeProfileHooks();
 
     void clear();
@@ -553,11 +554,12 @@ PythonStackTracker::installProfileHooks()
 {
     // Install our profile function in all existing threads.
     compat::setprofileAllThreads(PyTraceFunction, nullptr);
+}
 
+void
+PythonStackTracker::captureBackgroundThreadStacks()
+{
     // Find and record the Python stack for all existing threads.
-    std::unique_lock<std::mutex> lock(s_mutex);
-    StopTheWorldGuard stop_the_world;
-
     std::unordered_map<PyThreadState*, std::vector<LazilyEmittedFrame>> stack_by_thread;
     for (PyThreadState* tstate =
                  PyInterpreterState_ThreadHead(compat::threadStateGetInterpreter(PyThreadState_Get()));
@@ -575,6 +577,7 @@ PythonStackTracker::installProfileHooks()
         }
     }
 
+    std::unique_lock<std::mutex> lock(s_mutex);
     s_initial_stack_by_thread.swap(stack_by_thread);
 
     // Register that tracking has begun (again?), telling threads to sync their
@@ -646,7 +649,6 @@ Tracker::Tracker(
     updateModuleCacheImpl();
 
     PythonStackTracker::s_native_tracking_enabled = native_traces;
-    PythonStackTracker::installProfileHooks();
     if (d_trace_python_allocators) {
         registerPymallocHooks();
     }
@@ -654,6 +656,7 @@ Tracker::Tracker(
     d_background_thread->start();
 
     d_patcher.overwrite_symbols();
+    PythonStackTracker::installProfileHooks();
 }
 
 Tracker::~Tracker()
@@ -867,7 +870,11 @@ Tracker::childFork()
             old_tracker->d_memory_interval,
             old_tracker->d_follow_fork,
             old_tracker->d_trace_python_allocators));
-    Tracker::activate();
+
+    StopTheWorldGuard stop_the_world;
+    PythonStackTracker::captureBackgroundThreadStacks();
+    std::unique_lock<std::mutex> lock(*s_mutex);
+    tracking_api::Tracker::activate();
     RecursionGuard::setValue(false);
 }
 
@@ -1126,7 +1133,6 @@ Tracker::createTracker(
         bool follow_fork,
         bool trace_python_allocators)
 {
-    // Note: the GIL is used for synchronization of the singleton
     s_instance_owner.reset(new Tracker(
             std::move(record_writer),
             native_traces,
@@ -1134,6 +1140,8 @@ Tracker::createTracker(
             follow_fork,
             trace_python_allocators));
 
+    StopTheWorldGuard stop_the_world;
+    PythonStackTracker::captureBackgroundThreadStacks();
     std::unique_lock<std::mutex> lock(*s_mutex);
     tracking_api::Tracker::activate();
     Py_RETURN_NONE;
