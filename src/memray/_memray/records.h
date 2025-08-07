@@ -218,7 +218,7 @@ struct RawFrame
     const char* linetable;
     size_t linetable_size;
     int firstlineno;
-    const void* code_object_ptr;  // Pointer to PyCodeObject for caching
+    PyCodeObject* code_object_ptr;
     code_object_id_t code_object_id{0};  // ID assigned by tracker
 
     auto operator==(const RawFrame& other) const -> bool

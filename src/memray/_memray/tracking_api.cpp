@@ -26,6 +26,13 @@
 using namespace memray::exception;
 using namespace std::chrono_literals;
 
+extern "C" Py_ssize_t
+_PyEval_RequestCodeExtraIndex(freefunc free);
+extern "C" int
+_PyCode_GetExtra(PyObject* code, Py_ssize_t index, void** extra);
+extern "C" int
+_PyCode_SetExtra(PyObject* code, Py_ssize_t index, void* extra);
+
 namespace {
 
 #ifdef __linux__
@@ -70,6 +77,10 @@ class StopTheWorldGuard
 
     PyInterpreterState* d_interp;
 };
+
+#if PY_VERSION_HEX < 0x030C0000
+Py_ssize_t s_extra_index = -1;
+#endif
 
 }  // namespace
 
@@ -512,6 +523,17 @@ PythonStackTracker::LazilyEmittedFrame
 PythonStackTracker::createLazilyEmittedFrame(PyFrameObject* frame)
 {
     PyCodeObject* code = compat::frameGetCode(frame);
+#if PY_VERSION_HEX < 0x030C0000
+    if (s_extra_index != -1) {
+        void* extra;
+        if (-1 == _PyCode_GetExtra((PyObject*)code, s_extra_index, &extra)) {
+            throw std::runtime_error("Failed to get extra data from code object");
+        }
+        if (!extra && -1 == _PyCode_SetExtra((PyObject*)code, s_extra_index, code)) {
+            throw std::runtime_error("Failed to set extra data on code object");
+        }
+    }
+#endif
 
     const char* function = PyUnicode_AsUTF8(code->co_name);
     if (function == nullptr) {
@@ -638,7 +660,7 @@ Tracker::Tracker(
 , d_trace_python_allocators(trace_python_allocators)
 {
     static std::once_flag once;
-    call_once(once, [] {
+    call_once(once, [this] {
         // We use the pthread TLS API for this vector because we must be able
         // to re-create it while TLS destructors are running (a destructor can
         // call malloc, hitting our malloc hook). POSIX guarantees multiple
@@ -653,6 +675,37 @@ Tracker::Tracker(
 
         hooks::ensureAllHooksAreValid();
         NativeTrace::setup();
+
+#if PY_VERSION_HEX >= 0x030C0000
+        PyCode_AddWatcher([](PyCodeEvent event, PyCodeObject* code) {
+            if (event == PY_CODE_EVENT_DESTROY) {
+                if (RecursionGuard::isActive() || !Tracker::isActive()) {
+                    return 0;
+                }
+                RecursionGuard guard;
+
+                std::unique_lock<std::mutex> lock(*s_mutex);
+                Tracker* tracker = Tracker::getTracker();
+                if (tracker) {
+                    tracker->forgetCodeObject(code);
+                }
+            }
+            return 0;
+        });
+#else
+        s_extra_index = _PyEval_RequestCodeExtraIndex([](void* code) {
+            if (RecursionGuard::isActive() || !Tracker::isActive()) {
+                return;
+            }
+            RecursionGuard guard;
+
+            std::unique_lock<std::mutex> lock(*s_mutex);
+            Tracker* tracker = Tracker::getTracker();
+            if (tracker) {
+                tracker->forgetCodeObject((PyCodeObject*)code);
+            }
+        });
+#endif
     });
 
     d_writer->setMainTidAndSkippedFrames(thread_id(), computeMainTidSkip());
@@ -1081,17 +1134,16 @@ Tracker::dropCachedThreadName()
 }
 
 code_object_id_t
-Tracker::registerCodeObject(const void* code_ptr, const CodeObject& code_obj)
+Tracker::registerCodeObject(PyCodeObject* code_ptr, const CodeObject& code_obj)
 {
-    CodeObjectCacheKey key{code_ptr, code_obj.function_name, code_obj.filename};
-    auto it = d_code_object_cache.find(key);
+    auto it = d_code_object_cache.find(code_ptr);
     if (it != d_code_object_cache.end()) {
         return it->second;
     }
 
     // New code object - register it
     code_object_id_t code_id = d_next_code_object_id++;
-    d_code_object_cache[key] = code_id;
+    d_code_object_cache[code_ptr] = code_id;
 
     // Write the code object record
     pycode_map_val_t code_record{
@@ -1108,6 +1160,12 @@ Tracker::registerCodeObject(const void* code_ptr, const CodeObject& code_obj)
     }
 
     return code_id;
+}
+
+void
+Tracker::forgetCodeObject(PyCodeObject* code)
+{
+    d_code_object_cache.erase(code);
 }
 
 frame_id_t
