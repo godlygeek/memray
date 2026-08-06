@@ -67,6 +67,21 @@ cdef extern from *:
     int set_thread_name_impl(const char* new_name)
 
 
+cdef extern from *:
+    """
+    #ifdef __linux__
+    # define WEAK __attribute__((weak))
+    #else
+    # define WEAK __attribute__((weak_import))
+    #endif
+
+    extern void free_sized(void*, size_t) WEAK;
+    extern void free_aligned_sized(void*, size_t, size_t) WEAK;
+    """
+    void free_sized(void*, size_t)
+    void free_aligned_sized(void*, size_t, size_t)
+
+
 def set_thread_name(new_name):
     return set_thread_name_impl(new_name)
 
@@ -81,6 +96,22 @@ cdef class MemoryAllocator:
         if self.ptr == NULL:
             raise RuntimeError("Pointer cannot be NULL")
         free(self.ptr)
+        self.ptr = NULL
+
+    def free_sized(self, size_t size):
+        if self.ptr == NULL:
+            raise RuntimeError("Pointer cannot be NULL")
+        if &free_sized == NULL:
+            raise RuntimeError("free_sized is not available on this platform")
+        free_sized(self.ptr, size)
+        self.ptr = NULL
+
+    def free_aligned_sized(self, size_t size):
+        if self.ptr == NULL:
+            raise RuntimeError("Pointer cannot be NULL")
+        if &free_sized == NULL:
+            raise RuntimeError("free_sized is not available on this platform")
+        free_aligned_sized(self.ptr, sizeof(void*), size)
         self.ptr = NULL
 
     def malloc(self, size_t size):
