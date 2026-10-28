@@ -1,0 +1,1 @@
+Fix stale frames and crashes when ``greenlet`` switches happen while asyncio cancels a task, or while code that was suspended in a greenlet before tracking started resumes. Memray now reads each thread's Python stack directly when it allocates, instead of mirroring it from profile events, so the reported stack can't drift from the real one.

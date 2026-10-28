@@ -1,0 +1,1 @@
+Memray no longer installs a profile function, so it can run alongside profilers, debuggers and coverage tools that use ``sys.setprofile``, and stacks stay correct if the profile function is changed while tracking. As a consequence, ``memray.start_thread_trace`` has been removed, and greenlets are no longer reported with their own thread IDs.

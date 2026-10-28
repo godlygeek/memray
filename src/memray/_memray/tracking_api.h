@@ -30,6 +30,7 @@
 #endif
 
 #include "frame_tree.h"
+#include "frame_walker.h"
 #include "hooks.h"
 #include "linker_shenanigans.h"
 #include "record_writer.h"
@@ -47,39 +48,59 @@
 
 namespace memray::tracking_api {
 
-#if defined(__linux__) && defined(__GLIBC__)
 class TrackerMutex
 {
   public:
     TrackerMutex() = default;
 
+#if defined(__linux__) && defined(__GLIBC__)
     ~TrackerMutex()
     {
         pthread_mutex_destroy(&d_mutex);
     }
+#endif
 
     TrackerMutex(const TrackerMutex&) = delete;
     TrackerMutex& operator=(const TrackerMutex&) = delete;
 
     void lock()
     {
+#if defined(__linux__) && defined(__GLIBC__)
         int error = pthread_mutex_lock(&d_mutex);
         if (error != 0) {
             throw std::system_error(error, std::generic_category(), "pthread_mutex_lock");
         }
+#else
+        d_mutex.lock();
+#endif
+        d_owner.store(std::this_thread::get_id(), std::memory_order_relaxed);
     }
 
     void unlock() noexcept
     {
+        d_owner.store(std::thread::id(), std::memory_order_relaxed);
+#if defined(__linux__) && defined(__GLIBC__)
         pthread_mutex_unlock(&d_mutex);
+#else
+        d_mutex.unlock();
+#endif
+    }
+
+    // Only the owning thread ever stores its own ID, so this can't return
+    // true for a thread that doesn't hold the lock, or vice versa.
+    bool heldByCurrentThread() const noexcept
+    {
+        return d_owner.load(std::memory_order_relaxed) == std::this_thread::get_id();
     }
 
   private:
+#if defined(__linux__) && defined(__GLIBC__)
     pthread_mutex_t d_mutex = PTHREAD_ADAPTIVE_MUTEX_INITIALIZER_NP;
-};
 #else
-using TrackerMutex = std::mutex;
+    std::mutex d_mutex;
 #endif
+    std::atomic<std::thread::id> d_owner{};
+};
 
 bool
 getRSSFromProcStatus(const std::string& proc_status, size_t* rss_in_bytes);
@@ -140,32 +161,6 @@ struct RecursionGuard
     }
 #endif
 };
-
-// Trace function interface
-
-/**
- * Trace function to be installed in all Python treads to track function calls
- *
- * This trace function's sole purpose is to give a thread-safe, GIL-synchronized view of the Python
- * stack. To retrieve the Python stack using the C-API forces the caller to have the GIL held. Requiring
- * the GIL in the allocator function has too much impact on performance and can deadlock extension
- * modules that have native locks that are not synchronized themselves with the GIL. For this reason we
- * need a way to record and store the Python call frame information in a way that we can read without the
- * need to use the C-API. This trace function writes to disk the PUSH and POP operations so the Python
- *stack at any point can be reconstructed later.
- *
- **/
-int
-PyTraceFunction(PyObject* obj, PyFrameObject* frame, int what, PyObject* arg);
-
-/**
- * Installs the trace function in the current thread.
- *
- * This function installs the trace function in the current thread using the C-API.
- *
- * */
-void
-install_trace_function();
 
 /**
  * Install our pthread fork handlers.
@@ -259,8 +254,8 @@ class NativeTrace
  * This class acts as the only interface to the tracing functionality and encapsulates all the
  * required global state. *All access* must be done through the singleton interface as the singleton
  * has the same lifetime of the entire program. The singleton can be activated and deactivated to
- * temporarily stop the tracking as desired. The singleton manages a mirror copy of the Python stack
- * so it can be accessed synchronized by its the allocation tracking interfaces.
+ * temporarily stop the tracking as desired. At each allocation, the allocating thread reads its own
+ * Python stack directly, without needing the GIL, and records how it changed since the last time.
  * */
 class Tracker
 {
@@ -420,24 +415,23 @@ class Tracker
     bool pushFrame(const Frame& frame);
     bool popFrames(uint32_t count);
 
+    // On the main thread, prepend the frames the reader drops from the
+    // start of every stack, if `stack` (outermost first) doesn't have them.
+    void addSkippedFramesIfNeeded(std::vector<Frame>& stack) const;
+
     // code object registration
-    code_object_id_t registerCodeObject(PyCodeObject* code_ptr, const CodeObject& code_obj);
+    // Returns the code object's ID, or 0 if it hasn't been registered.
+    code_object_id_t lookupCodeObject(PyCodeObject* code_ptr) const;
+    // Registers a code object that isn't registered yet, returning its ID.
+    code_object_id_t registerCodeObject(PyCodeObject* code_ptr, CodeObjectInfo code_info);
     void forgetCodeObject(PyCodeObject* code);
+    // Called when any code object is destroyed.
+    static void forgetDestroyedCodeObject(PyCodeObject* code);
 
     // Interface to activate/deactivate the tracking
     static bool isActive();
     static void activate();
     static void deactivate();
-
-    /**
-     * Sets a flag to enable integration with the `greenlet` module.
-     */
-    static void beginTrackingGreenlets();
-
-    /**
-     * Handle a notification of control switching from one greenlet to another.
-     */
-    static void handleGreenletSwitch(PyObject* from, PyObject* to);
 
     static void prepareFork();
     static void parentFork();
@@ -477,6 +471,7 @@ class Tracker
     static std::unique_ptr<Tracker> s_instance_owner;
     static std::atomic<Tracker*> s_instance;
 
+    const frame_walker::FrameLayout d_frame_layout;
     std::shared_ptr<RecordWriter> d_writer;
     FrameTree d_native_trace_tree;
     const bool d_unwind_native_frames;
@@ -487,6 +482,8 @@ class Tracker
     linker::SymbolPatcher d_patcher;
     std::unique_ptr<BackgroundThread> d_background_thread;
 
+    thread_id_t d_main_tid{};
+    std::vector<Frame> d_main_thread_skipped_frames;
     std::unordered_map<PyCodeObject*, code_object_id_t> d_code_object_cache;
     code_object_id_t d_next_code_object_id{1};
     std::unordered_map<uint64_t, std::string> d_cached_thread_names;
@@ -494,6 +491,7 @@ class Tracker
 
     // Methods
     static size_t computeMainTidSkip();
+    void recordMainThreadSkippedFrames(size_t num_frames);
 
     void trackAllocationImpl(
             void* ptr,

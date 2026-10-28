@@ -42,6 +42,7 @@ from cpython.pylifecycle cimport Py_FinalizeEx
 from libc.errno cimport errno
 from libc.stdint cimport uintptr_t
 from libc.stdlib cimport exit as _exit
+from libcpp.string cimport string
 from libcpp.vector cimport vector
 
 from ._destination import Destination
@@ -308,3 +309,222 @@ cdef class PrimeCaches:
         return self
     def __exit__(self, *args):
         sys.setprofile(self.old_profile)
+
+
+cdef extern from *:
+    """
+    #include <cstddef>
+    #include <cstring>
+    #include <stdexcept>
+    #include <vector>
+    #include "frame_walker.h"
+    #include "frameobject.h"
+
+    namespace {
+    PyObject* walk_current_thread_impl()
+    {
+        using namespace memray::frame_walker;
+        FrameLayout layout = loadFrameLayout();
+        std::vector<RawFrame> frames(16);
+        size_t count;
+        while ((count = walkCurrentThread(layout, frames.data(), frames.size())) > frames.size()) {
+            frames.resize(count);
+        }
+
+        PyObject* ret = PyList_New(0);
+        for (size_t i = 0; ret && i < count; ++i) {
+            PyObject* item = Py_BuildValue(
+                    "(OiN)",
+                    (PyObject*)frames[i].code,
+                    frames[i].instruction_offset,
+                    PyBool_FromLong(frames[i].is_entry_frame));
+            if (!item || PyList_Append(ret, item) < 0) {
+                Py_XDECREF(item);
+                Py_CLEAR(ret);
+                break;
+            }
+            Py_DECREF(item);
+        }
+        return ret;
+    }
+
+#if PY_VERSION_HEX >= 0x030D0000
+    using memray::frame_walker::DebugOffsets;
+
+    PyObject* runtime_debug_offsets_impl()
+    {
+        const DebugOffsets* table = memray::frame_walker::findRuntimeDebugOffsets();
+        if (!table) {
+            throw std::runtime_error("_PyRuntime not found");
+        }
+        return PyBytes_FromStringAndSize(
+                reinterpret_cast<const char*>(table), sizeof(DebugOffsets));
+    }
+
+    DebugOffsets debug_offsets_from_bytes(const std::string& table)
+    {
+        DebugOffsets ret;
+        if (table.size() != sizeof(ret)) {
+            throw std::invalid_argument("debug offsets table has the wrong size");
+        }
+        memcpy(&ret, table.data(), sizeof(ret));
+        return ret;
+    }
+
+    std::string validate_debug_offsets_impl(const std::string& table)
+    {
+        return memray::frame_walker::validateDebugOffsets(debug_offsets_from_bytes(table));
+    }
+
+    PyObject* debug_offsets_layout_impl()
+    {
+        return Py_BuildValue(
+                "{s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n}",
+                "cookie", (Py_ssize_t)offsetof(DebugOffsets, cookie),
+                "version", (Py_ssize_t)offsetof(DebugOffsets, version),
+                "free_threaded", (Py_ssize_t)offsetof(DebugOffsets, free_threaded),
+                "thread_state.size", (Py_ssize_t)offsetof(DebugOffsets, thread_state.size),
+                "thread_state.current_frame",
+                (Py_ssize_t)offsetof(DebugOffsets, thread_state.current_frame),
+                "interpreter_frame.size",
+                (Py_ssize_t)offsetof(DebugOffsets, interpreter_frame.size),
+                "interpreter_frame.previous",
+                (Py_ssize_t)offsetof(DebugOffsets, interpreter_frame.previous),
+                "interpreter_frame.executable",
+                (Py_ssize_t)offsetof(DebugOffsets, interpreter_frame.executable),
+                "interpreter_frame.instr_ptr",
+                (Py_ssize_t)offsetof(DebugOffsets, interpreter_frame.instr_ptr),
+                "interpreter_frame.owner",
+                (Py_ssize_t)offsetof(DebugOffsets, interpreter_frame.owner));
+    }
+
+    PyObject* debug_offsets_vs_public_headers_impl()
+    {
+        const DebugOffsets* t = memray::frame_walker::findRuntimeDebugOffsets();
+        if (!t) {
+            throw std::runtime_error("_PyRuntime not found");
+        }
+        return Py_BuildValue(
+                "{s:(KK),s:(KK),s:(KK),s:(KK),s:(KK),s:(KK)}",
+                "thread_state.current_frame",
+                (unsigned long long)t->thread_state.current_frame,
+                (unsigned long long)offsetof(PyThreadState, current_frame),
+                "code_object.filename",
+                (unsigned long long)t->code_object.filename,
+                (unsigned long long)offsetof(PyCodeObject, co_filename),
+                "code_object.name",
+                (unsigned long long)t->code_object.name,
+                (unsigned long long)offsetof(PyCodeObject, co_name),
+                "code_object.linetable",
+                (unsigned long long)t->code_object.linetable,
+                (unsigned long long)offsetof(PyCodeObject, co_linetable),
+                "code_object.firstlineno",
+                (unsigned long long)t->code_object.firstlineno,
+                (unsigned long long)offsetof(PyCodeObject, co_firstlineno),
+                "code_object.co_code_adaptive",
+                (unsigned long long)t->code_object.co_code_adaptive,
+                (unsigned long long)offsetof(PyCodeObject, co_code_adaptive));
+    }
+
+#else
+    PyObject* runtime_debug_offsets_impl()
+    {
+        throw std::runtime_error("no debug offsets table before Python 3.13");
+    }
+
+    std::string validate_debug_offsets_impl(const std::string&)
+    {
+        throw std::runtime_error("no debug offsets table before Python 3.13");
+    }
+
+    PyObject* debug_offsets_layout_impl()
+    {
+        throw std::runtime_error("no debug offsets table before Python 3.13");
+    }
+
+    PyObject* debug_offsets_vs_public_headers_impl()
+    {
+        throw std::runtime_error("no debug offsets table before Python 3.13");
+    }
+#endif
+
+    PyObject* read_code_object_info_impl(PyObject* code)
+    {
+        if (!PyCode_Check(code)) {
+            throw std::invalid_argument("expected a code object");
+        }
+        auto info = memray::frame_walker::readCodeObjectInfo((PyCodeObject*)code);
+        return Py_BuildValue(
+                "(s#s#y#i)",
+                info.function_name.data(), (Py_ssize_t)info.function_name.size(),
+                info.filename.data(), (Py_ssize_t)info.filename.size(),
+                info.linetable.data(), (Py_ssize_t)info.linetable.size(),
+                info.firstlineno);
+    }
+    PyObject* cpython_is_entry_frame_impl(PyObject* frame)
+    {
+    #if PY_VERSION_HEX >= 0x030B0000
+        if (!PyFrame_Check(frame)) {
+            throw std::invalid_argument("expected a frame");
+        }
+        return PyBool_FromLong(_PyFrame_IsEntryFrame((PyFrameObject*)frame));
+    #else
+        throw std::runtime_error("no entry frames before Python 3.11");
+    #endif
+    }
+    }  // namespace
+    """
+    object walk_current_thread_impl() except +
+    object runtime_debug_offsets_impl() except +
+    string validate_debug_offsets_impl(const string&) except +
+    object debug_offsets_layout_impl() except +
+    object debug_offsets_vs_public_headers_impl() except +
+    object read_code_object_info_impl(object) except +
+    object cpython_is_entry_frame_impl(object) except +
+
+
+def walk_current_thread():
+    """Walk this thread's frames with memray's frame walker.
+
+    Returns a list of (code object, instruction offset, is entry frame)
+    tuples, innermost first.
+    """
+    return walk_current_thread_impl()
+
+
+def runtime_debug_offsets():
+    """Return the raw bytes of the interpreter's debug offsets table."""
+    return runtime_debug_offsets_impl()
+
+
+def validate_debug_offsets(bytes table):
+    """Return why memray would reject a debug offsets table, or ''."""
+    return validate_debug_offsets_impl(table)
+
+
+def debug_offsets_layout():
+    """Return the byte position of some fields within the offsets table."""
+    return debug_offsets_layout_impl()
+
+
+def debug_offsets_vs_public_headers():
+    """Return {field: (offset from the table, offset from public headers)}."""
+    return debug_offsets_vs_public_headers_impl()
+
+
+def read_code_object_info(code):
+    """Read (name, filename, linetable, firstlineno) without using the GIL."""
+    return read_code_object_info_impl(code)
+
+
+def allocate_without_gil(size_t size):
+    cdef void* p = NULL
+    with nogil:
+        p = valloc(size)
+    do_not_optimize_ptr(p)
+    free(p)
+
+
+def cpython_is_entry_frame(frame):
+    """Ask CPython whether a frame is an entry frame (3.11 and later)."""
+    return cpython_is_entry_frame_impl(frame)

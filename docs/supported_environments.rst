@@ -66,10 +66,9 @@ Known issues and limitations
 * Cython_ functions will not be included in the Python stacks we report, even
   if the Cython module is built with profiling_ support. You'll need to use
   :ref:`native tracking` to see what's happening inside Cython modules.
-* We have experimental support for the ``greenlet`` library, which may lead to
-  incorrect stacks being reported if :doc:`the Memray API <api>` is used to
-  start tracking in one thread while another thread is already making use of
-  the Greenlet library.
+* Allocations made by code running in a ``greenlet`` are reported with the
+  greenlet's own Python stack, under the thread ID of the thread that runs the
+  greenlet. Greenlets don't get thread IDs of their own.
 
 .. _an os.exec function: https://docs.python.org/3/library/os.html#os.execl
 .. _multiprocessing start method: https://docs.python.org/3/library/multiprocessing.html#contexts-and-start-methods

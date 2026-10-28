@@ -405,9 +405,6 @@ dlopen(const char* filename, int flag) noexcept
     }
     if (ret) {
         tracking_api::Tracker::invalidate_module_cache();
-        if (filename && nullptr != strstr(filename, "/_greenlet.")) {
-            tracking_api::Tracker::beginTrackingGreenlets();
-        }
     }
     return ret;
 }
@@ -550,14 +547,6 @@ prctl(int option, ...) noexcept
     return ret;
 }
 #endif
-
-PyGILState_STATE
-PyGILState_Ensure() noexcept
-{
-    PyGILState_STATE ret = MEMRAY_ORIG(PyGILState_Ensure)();
-    tracking_api::install_trace_function();
-    return ret;
-}
 
 int
 pyreftracer(PyObject* obj, compat::RefTracerEvent event, void* data) noexcept

@@ -124,6 +124,8 @@ add_custom_command(
 )
 python_add_library(_memray MODULE WITH_SOABI
     src/memray/_memray/compat.cpp
+    src/memray/_memray/frame_layout_core.c
+    src/memray/_memray/frame_walker.cpp
     src/memray/_memray/hooks.cpp
     src/memray/_memray/tracking_api.cpp
     src/memray/_memray/${BINARY_FORMAT}_shenanigans.cpp
@@ -194,7 +196,10 @@ add_custom_command(
 )
 python_add_library(_test_utils MODULE WITH_SOABI
     ${CMAKE_CURRENT_BINARY_DIR}/_memray_test_utils.cpp
+    src/memray/_memray/frame_layout_core.c
+    src/memray/_memray/frame_walker.cpp
 )
+target_link_libraries(_test_utils PRIVATE dl)
 target_include_directories(_test_utils PRIVATE
     ${CMAKE_SOURCE_DIR}/src/memray/_memray
 )

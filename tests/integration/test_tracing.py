@@ -288,22 +288,34 @@ def test_traceback_for_high_watermark_records_can_be_retrieved_twice(tmpdir):
     assert traceback1 == traceback2
 
 
-def test_profile_function_is_restored_after_tracking(tmpdir):
+def test_profile_functions_are_not_touched_by_tracking(tmpdir):
     # GIVEN
     def profilefunc(*args):
+        pass
+
+    def thread_profilefunc(*args):
         pass
 
     output = Path(tmpdir) / "test.bin"
 
     # WHEN
+    def get_profile_functions():
+        # threading.getprofile() is new in 3.10.
+        return (sys.getprofile(), threading._profile_hook)
 
     sys.setprofile(profilefunc)
-
-    with Tracker(output):
-        assert sys.getprofile() != profilefunc
+    threading.setprofile(thread_profilefunc)
+    try:
+        with Tracker(output):
+            during = get_profile_functions()
+        after = get_profile_functions()
+    finally:
+        sys.setprofile(None)
+        threading.setprofile(None)
 
     # THEN
-    assert sys.getprofile() == profilefunc
+    assert during == (profilefunc, thread_profilefunc)
+    assert after == (profilefunc, thread_profilefunc)
 
 
 def test_initial_tracking_frames_are_correctly_populated(tmpdir):
@@ -899,7 +911,7 @@ def test_cython_frame_in_pre_existing_thread_stack_when_restarting_tracking(tmp_
 def test_allocation_after_unsetting_profile_function(tmp_path):
     """After tracking starts, unset the profile function then allocate.
 
-    Make sure that the stack for the allocation is unknown.
+    Make sure that the stack for the allocation is still correct.
     """
     # GIVEN
     allocator = MemoryAllocator()
@@ -935,13 +947,13 @@ def test_allocation_after_unsetting_profile_function(tmp_path):
         "func",
         "test_allocation_after_unsetting_profile_function",
     ]
-    assert alloc2_funcs == []
+    assert alloc2_funcs == alloc1_funcs
 
 
 def test_allocation_in_thread_after_unsetting_profile_function(tmp_path):
     """In a thread, unset the profile function then allocate.
 
-    Make sure that the stack for the allocation is unknown.
+    Make sure that the stack for the allocation is still correct.
     """
     # GIVEN
     allocator = MemoryAllocator()
@@ -975,7 +987,7 @@ def test_allocation_in_thread_after_unsetting_profile_function(tmp_path):
     alloc2_funcs = [frame[0] for frame in second.stack_trace()]
 
     assert alloc1_funcs[:2] == ["valloc", "func"]
-    assert alloc2_funcs == []
+    assert alloc2_funcs == alloc1_funcs
 
 
 class TestMmap:
@@ -1018,7 +1030,7 @@ class TestMmap:
         # GIVEN / WHEN
         output = Path(tmpdir) / "test.bin"
 
-        def custom_trace_fn():  # pragma: no cover
+        def custom_trace_fn(*args):
             pass
 
         try:

@@ -19,6 +19,8 @@ add_library(
   ${MEMRAY_LINKER_FILE}
   inject.cpp
   compat.cpp
+  frame_layout_core.c
+  frame_walker.cpp
   hooks.cpp
   logging.cpp
   native_resolver.cpp

@@ -59,7 +59,6 @@ from _memray.source cimport SocketSource
 from _memray.tracking_api cimport RecursionGuard
 from _memray.tracking_api cimport Tracker as NativeTracker
 from _memray.tracking_api cimport getRSSFromProcStatus
-from _memray.tracking_api cimport install_trace_function
 from _memray.tracking_api cimport set_up_pthread_fork_handlers
 from cpython cimport Py_DECREF
 from cpython cimport PyErr_CheckSignals
@@ -750,8 +749,6 @@ cdef class Tracker:
     cdef unsigned int _memory_interval_ms
     cdef bool _follow_fork
     cdef bool _trace_python_allocators
-    cdef object _previous_profile_func
-    cdef object _previous_thread_profile_func
     cdef object _patched_thread_class
     cdef unique_ptr[RecordWriter] _writer
     cdef object _surviving_objects
@@ -863,21 +860,18 @@ cdef class Tracker:
 
                 setattr(self._patched_thread_class, "_set_os_name", set_os_name_wrapper)
 
-            self._previous_profile_func = sys.getprofile()
-            self._previous_thread_profile_func = threading._profile_hook
-            threading.setprofile(start_thread_trace)
-
-            if "greenlet" in sys.modules:
-                NativeTracker.beginTrackingGreenlets()
-
-            NativeTracker.createTracker(
-                move(writer),
-                self._native_traces,
-                self._memory_interval_ms,
-                self._follow_fork,
-                self._trace_python_allocators,
-                self._track_object_lifetimes,
-            )
+            try:
+                NativeTracker.createTracker(
+                    move(writer),
+                    self._native_traces,
+                    self._memory_interval_ms,
+                    self._follow_fork,
+                    self._trace_python_allocators,
+                    self._track_object_lifetimes,
+                )
+            except BaseException:
+                self._unpatch_thread_class()
+                raise
             return self
 
     @cython.profile(False)
@@ -886,15 +880,15 @@ cdef class Tracker:
             self._populate_surviving_objects()
         with tracker_creation_lock:
             NativeTracker.destroyTracker()
-            sys.setprofile(self._previous_profile_func)
-            threading.setprofile(self._previous_thread_profile_func)
+            self._unpatch_thread_class()
 
-            for attr in ("_name", "_ident"):
-                try:
-                    delattr(self._patched_thread_class, attr)
-                except AttributeError:
-                    pass
-            self._patched_thread_class = None
+    def _unpatch_thread_class(self):
+        for attr in ("_name", "_ident"):
+            try:
+                delattr(self._patched_thread_class, attr)
+            except AttributeError:
+                pass
+        self._patched_thread_class = None
 
     cdef void _populate_surviving_objects(self):
         cdef NativeTracker *tracker = NativeTracker.getTracker()
@@ -926,26 +920,6 @@ cdef class Tracker:
                 "Tracking was never started or has not finished yet or failed."
             )
         return tuple(self._surviving_objects)
-
-
-def start_thread_trace(frame, event, arg):
-    if event in {"call", "c_call"}:
-        install_trace_function()
-    return start_thread_trace
-
-
-def greenlet_trace_function(event, args):
-    if event in {"switch", "throw"}:
-        NativeTracker.handleGreenletSwitch(args[0], args[1])
-
-
-def print_greenlet_warning():
-    print(
-        "⚠ Memray support for Greenlet is experimental ⚠\n"
-        "Please report any issues at https://github.com/bloomberg/memray/issues\n"
-        "\n",
-        file=sys.stderr,
-    )
 
 
 cdef millis_to_dt(millis):
@@ -2050,3 +2024,17 @@ cdef class RecordWriterTestHarness:
     def write_trailer(self) -> bool:
         """Write the trailer to the file."""
         return self._writer.get().writeTrailer()
+
+
+cdef extern from "frame_walker.h" namespace "memray::frame_walker":
+    void setDebugOffsetsOverrideForTesting(const cppstring&) except +
+
+
+def _set_debug_offsets_override_for_testing(table):
+    """Make Trackers started from now on use *table* as the debug offsets.
+
+    *table* is the raw bytes of a debug offsets table, or None to go back to
+    using the interpreter's real table. For tests only, and only on Python
+    3.13 and later.
+    """
+    setDebugOffsetsOverrideForTesting(b"" if table is None else bytes(table))
