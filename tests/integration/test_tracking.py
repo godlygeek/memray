@@ -8,6 +8,7 @@ import sys
 import textwrap
 import threading
 import time
+import weakref
 from pathlib import Path
 
 import pytest
@@ -1926,3 +1927,80 @@ def test_module_stats_attributes_to_non_stdlib(tmp_path):
         assert isinstance(module_name, str)
         assert count > 0
         assert total_bytes > 0
+
+
+class TestFrameReferences:
+    class Sentinel:
+        pass
+
+    def test_frames_are_released_when_functions_return(self, tmp_path):
+        # GIVEN
+        output = tmp_path / "test.bin"
+
+        def func():
+            sentinel = self.Sentinel()
+            return weakref.ref(sentinel)
+
+        # WHEN
+        with Tracker(output):
+            ref = func()
+
+            # THEN
+            assert ref() is None
+
+    def test_frames_on_stack_are_released_when_tracking_stops(self, tmp_path):
+        # GIVEN
+        output = tmp_path / "test.bin"
+
+        def func():
+            sentinel = self.Sentinel()
+            with Tracker(output):
+                pass
+            return weakref.ref(sentinel)
+
+        # WHEN
+        ref = func()
+
+        # THEN
+        assert ref() is None
+
+    @pytest.mark.parametrize("allocate_after_uninstalling", [True, False])
+    @pytest.mark.parametrize("thread_exits_first", [True, False])
+    def test_frames_are_released_when_thread_uninstalls_profile_function(
+        self, tmp_path, allocate_after_uninstalling, thread_exits_first
+    ):
+        # GIVEN
+        output = tmp_path / "test.bin"
+        allocator = MemoryAllocator()
+        refs = []
+        uninstalled = threading.Event()
+        tracking_stopped = threading.Event()
+
+        def func():
+            sentinel = self.Sentinel()
+            refs.append(weakref.ref(sentinel))
+            sys.setprofile(None)
+            if allocate_after_uninstalling:
+                allocator.valloc(1234)
+                allocator.free()
+
+        def thread_body():
+            func()
+            uninstalled.set()
+            if not thread_exits_first:
+                tracking_stopped.wait()
+
+        # WHEN
+        with Tracker(output):
+            thread = threading.Thread(target=thread_body)
+            thread.start()
+            uninstalled.wait()
+            if thread_exits_first:
+                thread.join()
+
+        # THEN
+        try:
+            assert refs[0]() is None
+        finally:
+            tracking_stopped.set()
+            thread.join()

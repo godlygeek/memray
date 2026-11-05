@@ -157,33 +157,21 @@ thread_id()
 
 // Tracker interface
 
-// If a TLS variable has not been constructed, accessing it will cause it to be
-// constructed. That's normally great, but we need to prevent that from
-// happening unexpectedly for the TLS vector owned by this class.
+// Methods of this class can be called during thread teardown, after the
+// thread's C++ thread_local objects have been destroyed. Destructors can
+// allocate memory, or even run Python code via PyGILState_Ensure. A C++
+// thread_local that's used after being destroyed isn't constructed again: the
+// destroyed object is reused. And one first constructed after the thread's
+// thread_local destructors have run is never destroyed. So this class must
+// have a trivial destructor, and the shadow stack is heap allocated, with its
+// lifetime managed by a pthread key instead. pthread key destructors run after
+// all C++ thread_local destructors, and POSIX runs another round of them if
+// one sets a key's value again, as pushLazilyEmittedFrame would.
 //
-// Methods of this class can be called during thread teardown. It's possible
-// that, after the TLS vector for a dying thread has already been destroyed,
-// libpthread makes a call to free() that calls into our Tracker, and if it
-// does, we must prevent it touching the vector again and re-constructing it.
-// Otherwise, it would be re-constructed immediately but its destructor would
-// be added to this thread's list of finalizers after all the finalizers for
-// the thread already ran.  If that happens, the vector will be free()d before
-// its destructor runs. Worse, its destructor will remain on the list of
-// finalizers for the current thread's pthread struct, and its destructor will
-// later be run on that already free()d memory if this thread's pthread struct
-// is ever reused. When that happens it tends to cause heap corruption, because
-// another vector is placed at the same location as the original one, and the
-// vector destructor runs twice on it (once for the newly created vector, and
-// once for the vector that had been created before the thread died and the
-// pthread struct was reused).
-//
-// To prevent that, we create the vector in one method, pushLazilyEmittedFrame.
-// All other methods access a pointer called `d_stack` that is set to the TLS
-// stack when it is created by pushLazilyEmittedFrame, and set to a null
-// pointer when the TLS stack is destroyed.
-//
-// This can result in this class being constructed during thread teardown, but
-// that doesn't cause the same problem because it has a trivial destructor.
+// The shadow stack owns references to its frames. When frames are removed at
+// a time when running arbitrary code isn't safe (without the GIL, with the
+// world stopped, with the Tracker lock held, or during thread teardown), the
+// references are set aside and later dropped by releaseDeferredFrames.
 class PythonStackTracker
 {
   private:
@@ -192,50 +180,47 @@ class PythonStackTracker
     class LazilyEmittedFrame
     {
       public:
-        LazilyEmittedFrame(PyFrameObject* frame);
+        // Takes a new reference to `frame`.
+        explicit LazilyEmittedFrame(PyFrameObject* frame);
+
+        PyFrameObject* frame() const;
 
         // Has this frame been emitted already?
         bool isEmitted() const;
 
-        // Update the instruction offset from the frame, if possible.
+        // Update the instruction offset from the frame.
         // If the offset changes, mark the frame as not emitted.
         void updateInstructionOffset();
 
-        // Drop our reference to the frame, freezing the instruction offset.
-        void freezeInstructionOffset();
-
-        // Has the instruction offset been frozen?
-        bool isFrozen() const;
-
-        // If we haven't already, register the held code object, saving its ID
-        // and dropping our borrowed reference to the code object.
-        void resolveCodeObjectId(Tracker& tracker);
+        // Transfer ownership of our frame reference to the caller.
+        PyFrameObject* releaseFrame();
 
         // Emit this frame if it hasn't already been emitted.
         // Returns true on success or if the frame was already emitted.
         bool emit(Tracker& tracker);
 
       private:
+        struct FrameDecref
+        {
+            void operator()(PyFrameObject* frame) const
+            {
+                Py_DECREF(frame);
+            }
+        };
+
         bool d_emitted{false};
 
-        // Threads' initial stacks can have calls to sys.settrace tracing
-        // functions which our profile function won't see get popped. We can't
-        // hold borrowed references to those frames; we won't know when they
-        // die. For frames on those initial stacks, we resolve the instruction
-        // offset once up front then set `d_frame` to a null pointer.
-        PyFrameObject* d_frame{};
+        std::unique_ptr<PyFrameObject, FrameDecref> d_frame;
 
-        // Likewise, we can't hold borrowed references to the code objects
-        // owned by initial frames. We drop our reference once a code object id
-        // has been assigned. For initial frames, we assign that ID while the
-        // world is stopped, before the reference could become invalid.
+        // Borrowed; kept alive by `d_frame`.
         PyCodeObject* d_code{};
 
         // Information extracted from PyCodeObject while the GIL is held,
         // and later used while the GIL may not be held.
         CodeObject d_code_info{};
 
-        // The unique ID assigned by the Tracker for the associated code object
+        // The unique ID assigned by the Tracker for the associated code
+        // object, or 0 if one hasn't been assigned yet.
         code_object_id_t d_code_object_id{};
 
         // Whether this frame is an entry frame for native unwinding purposes.
@@ -250,10 +235,15 @@ class PythonStackTracker
     static bool s_native_tracking_enabled;
 
     static void installProfileHooks();
-    static void recordAllStacks(Tracker& tracker);
+    static void recordAllStacks();
     static void removeProfileHooks();
 
     static PythonStackTracker& get();
+    static void discardStack();
+    // Requires the GIL and no locks held, as it can run arbitrary code.
+    static void releaseDeferredFrames();
+    static void resetAfterFork();
+    static void initialize();
     void emitPendingPushesAndPops();
     void populateShadowStack();
     void handleTraceEvent(int what, PyFrameObject* frame);
@@ -265,20 +255,38 @@ class PythonStackTracker
     // Fetch the thread-local stack tracker without checking if its stack needs to be reloaded.
     static PythonStackTracker& getUnsafe();
 
-    static std::vector<LazilyEmittedFrame>
-    pythonFrameToStack(PyFrameObject* current_frame, Tracker& tracker);
-
     void reloadStackIfTrackerChanged();
     void clear();
 
-    void pushLazilyEmittedFrame(const LazilyEmittedFrame& frame);
+    void pushLazilyEmittedFrame(LazilyEmittedFrame&& frame);
 
-    int pushPythonFrame(PyFrameObject* frame);
+    void pushPythonFrame(PyFrameObject* frame);
     void popPythonFrame();
+
+    // Clear the stack, deferring the release of its frame references.
+    static void deferReleasingFrames(std::vector<LazilyEmittedFrame>& stack);
+    static void
+    deferReleasingFrames(std::unordered_map<PyThreadState*, std::vector<LazilyEmittedFrame>>& stacks);
+    // As above, but the caller must hold s_frame_ownership->mutex.
+    static void deferReleasingFramesLocked(std::vector<LazilyEmittedFrame>& stack);
+
+    static void destroyStack(void* stack);
+    static pthread_key_t s_stack_key;
 
     static std::mutex s_mutex;
     static std::unordered_map<PyThreadState*, std::vector<LazilyEmittedFrame>> s_initial_stack_by_thread;
     static std::atomic<unsigned int> s_tracker_generation;
+
+    // Leaked, since thread-local destructors can run after static ones.
+    struct FrameOwnershipState
+    {
+        std::mutex mutex;
+        // Every thread's shadow stack, so removeProfileHooks can clear them.
+        std::unordered_set<std::vector<LazilyEmittedFrame>*> stacks;
+        std::vector<PyFrameObject*> frames_to_release;
+    };
+    static FrameOwnershipState* s_frame_ownership;
+    static std::atomic<bool> s_have_frames_to_release;
 
     uint32_t d_num_pending_pops{};
     uint32_t d_tracker_generation{};
@@ -293,6 +301,10 @@ std::mutex PythonStackTracker::s_mutex;
 std::unordered_map<PyThreadState*, std::vector<PythonStackTracker::LazilyEmittedFrame>>
         PythonStackTracker::s_initial_stack_by_thread;
 std::atomic<unsigned int> PythonStackTracker::s_tracker_generation;
+PythonStackTracker::FrameOwnershipState* PythonStackTracker::s_frame_ownership =
+        new PythonStackTracker::FrameOwnershipState;
+std::atomic<bool> PythonStackTracker::s_have_frames_to_release;
+pthread_key_t PythonStackTracker::s_stack_key;
 
 PythonStackTracker&
 PythonStackTracker::get()
@@ -309,6 +321,107 @@ PythonStackTracker::getUnsafe()
     static_assert(std::is_trivially_destructible<PythonStackTracker>::value);
     MEMRAY_FAST_TLS thread_local PythonStackTracker t_python_stack_tracker;
     return t_python_stack_tracker;
+}
+
+void
+PythonStackTracker::discardStack()
+{
+    getUnsafe().clear();
+    releaseDeferredFrames();
+}
+
+void
+PythonStackTracker::deferReleasingFrames(std::vector<LazilyEmittedFrame>& stack)
+{
+    if (stack.empty()) {
+        return;
+    }
+
+    RecursionGuard guard;
+    std::lock_guard<std::mutex> lock(s_frame_ownership->mutex);
+    deferReleasingFramesLocked(stack);
+}
+
+void
+PythonStackTracker::deferReleasingFrames(
+        std::unordered_map<PyThreadState*, std::vector<LazilyEmittedFrame>>& stacks)
+{
+    for (auto& [tstate, stack] : stacks) {
+        deferReleasingFrames(stack);
+    }
+    stacks.clear();
+}
+
+void
+PythonStackTracker::deferReleasingFramesLocked(std::vector<LazilyEmittedFrame>& stack)
+{
+    for (auto& frame : stack) {
+        if (PyFrameObject* owned_frame = frame.releaseFrame()) {
+            s_frame_ownership->frames_to_release.push_back(owned_frame);
+            s_have_frames_to_release = true;
+        }
+    }
+    stack.clear();
+}
+
+void
+PythonStackTracker::releaseDeferredFrames()
+{
+    assert(PyGILState_Check());
+
+    if (!s_have_frames_to_release.load(std::memory_order_relaxed)) {
+        return;
+    }
+
+    std::vector<PyFrameObject*> frames;
+    {
+        RecursionGuard guard;
+        std::lock_guard<std::mutex> lock(s_frame_ownership->mutex);
+        frames.swap(s_frame_ownership->frames_to_release);
+        s_have_frames_to_release = false;
+    }
+
+    for (PyFrameObject* frame : frames) {
+        Py_DECREF(frame);
+    }
+}
+
+void
+PythonStackTracker::resetAfterFork()
+{
+    // Other threads may have been modifying their stacks or holding the mutex
+    // when we forked. Leak the old state.
+    RecursionGuard guard;
+    auto* state = new FrameOwnershipState;
+    if (getUnsafe().d_stack) {
+        state->stacks.insert(getUnsafe().d_stack);
+    }
+    s_frame_ownership = state;
+    s_have_frames_to_release = false;
+}
+
+void
+PythonStackTracker::initialize()
+{
+    if (0 != pthread_key_create(&s_stack_key, &destroyStack)) {
+        throw std::runtime_error{"Failed to create pthread key"};
+    }
+}
+
+void
+PythonStackTracker::destroyStack(void* data)
+{
+    auto* stack = static_cast<std::vector<LazilyEmittedFrame>*>(data);
+    getUnsafe().d_stack = nullptr;
+
+    // Frames remain only if our profile function was uninstalled.
+    RecursionGuard guard;
+    {
+        std::lock_guard<std::mutex> lock(s_frame_ownership->mutex);
+        s_frame_ownership->stacks.erase(stack);
+        deferReleasingFramesLocked(*stack);
+    }
+    delete stack;
 }
 
 void
@@ -396,7 +509,7 @@ PythonStackTracker::reloadStackIfTrackerChanged()
     // stopped and later restarted underneath our still-running thread).
 
     if (d_stack) {
-        d_stack->clear();
+        deferReleasingFrames(*d_stack);
     }
     d_num_pending_pops = 0;
 
@@ -415,7 +528,7 @@ PythonStackTracker::reloadStackIfTrackerChanged()
 
     // Iterate in reverse so that we push the most recent call last
     for (auto frame_it = correct_stack.rbegin(); frame_it != correct_stack.rend(); ++frame_it) {
-        pushLazilyEmittedFrame(*frame_it);
+        pushLazilyEmittedFrame(std::move(*frame_it));
     }
 }
 
@@ -440,11 +553,13 @@ PythonStackTracker::handleTraceEvent(int what, PyFrameObject* frame)
 {
     installGreenletTraceFunctionIfNeeded();
 
-    if (d_stack && !d_stack->empty() && d_stack->back().isFrozen()) {
-        // This stack was set by reloadStackIfTrackerChanged and may have calls
-        // to sys.settrace tracing functions on it. Drop it now, replacing it
-        // with a stack fetched from PyEval_GetFrame which we know can't have
-        // trace function frames on it, and which we can track properly.
+    // A stack captured by another thread may end with calls to sys.settrace
+    // trace functions that we never saw get popped. The real stack is then
+    // a prefix of ours, so it's enough to check the top frame. Our references
+    // ensure no frame on the stack can be freed and its address reused.
+    PyFrameObject* expected_top = what == PyTrace_CALL ? compat::frameGetBack(frame) : frame;
+    PyFrameObject* top = d_stack && !d_stack->empty() ? d_stack->back().frame() : nullptr;
+    if (top != expected_top) {
         populateShadowStack();
 
         if (what == PyTrace_CALL) {
@@ -461,40 +576,35 @@ PythonStackTracker::handleTraceEvent(int what, PyFrameObject* frame)
     }
 }
 
-int
+void
 PythonStackTracker::pushPythonFrame(PyFrameObject* frame)
 {
     try {
         pushLazilyEmittedFrame(LazilyEmittedFrame(frame));
-        return 0;
     } catch (const std::runtime_error&) {
-        return -1;
+        // Skip frames whose code object information can't be extracted.
     }
 }
 
 void
-PythonStackTracker::pushLazilyEmittedFrame(const LazilyEmittedFrame& frame)
+PythonStackTracker::pushLazilyEmittedFrame(LazilyEmittedFrame&& frame)
 {
     // Note: this function does not require the GIL.
-    struct StackCreator
-    {
-        std::vector<LazilyEmittedFrame> stack;
-
-        StackCreator()
+    if (!d_stack) {
+        const size_t INITIAL_PYTHON_STACK_FRAMES = 1024;
+        RecursionGuard guard;
+        auto* stack = new std::vector<LazilyEmittedFrame>;
+        stack->reserve(INITIAL_PYTHON_STACK_FRAMES);
         {
-            const size_t INITIAL_PYTHON_STACK_FRAMES = 1024;
-            stack.reserve(INITIAL_PYTHON_STACK_FRAMES);
-            PythonStackTracker::getUnsafe().d_stack = &stack;
+            std::lock_guard<std::mutex> lock(s_frame_ownership->mutex);
+            s_frame_ownership->stacks.insert(stack);
         }
-        ~StackCreator()
-        {
-            PythonStackTracker::getUnsafe().d_stack = nullptr;
-        }
-    };
-
-    MEMRAY_FAST_TLS static thread_local StackCreator t_stack_creator;
-    t_stack_creator.stack.push_back(frame);
-    assert(d_stack);  // The above call sets d_stack if it wasn't already set.
+        // If this fails, the stack leaks when the thread exits, but it stays
+        // registered, so it's still safe for removeProfileHooks to clear.
+        (void)pthread_setspecific(s_stack_key, stack);
+        d_stack = stack;
+    }
+    d_stack->push_back(std::move(frame));
 }
 
 void
@@ -508,6 +618,9 @@ PythonStackTracker::popPythonFrame()
         d_num_pending_pops += 1;
         assert(d_num_pending_pops != 0);  // Ensure we didn't overflow.
     }
+
+    // Pop before releasing the frame, since releasing can run arbitrary code.
+    LazilyEmittedFrame popped = std::move(d_stack->back());
     d_stack->pop_back();
 }
 
@@ -612,7 +725,6 @@ PythonStackTracker::LazilyEmittedFrame::LazilyEmittedFrame(PyFrameObject* frame)
 {
     assert(PyGILState_Check());
 
-    d_frame = frame;
     d_code = compat::frameGetCode(frame);
 #if PY_VERSION_HEX < 0x030C0000
     if (s_extra_index != -1) {
@@ -643,6 +755,15 @@ PythonStackTracker::LazilyEmittedFrame::LazilyEmittedFrame(PyFrameObject* frame)
     // If native tracking is not enabled, treat every frame as an entry frame.
     // It doesn't matter to the reader, and is more efficient.
     d_is_entry_frame = !s_native_tracking_enabled || compat::isEntryFrame(frame);
+
+    Py_INCREF(frame);
+    d_frame.reset(frame);
+}
+
+PyFrameObject*
+PythonStackTracker::LazilyEmittedFrame::frame() const
+{
+    return d_frame.get();
 }
 
 bool
@@ -654,35 +775,18 @@ PythonStackTracker::LazilyEmittedFrame::isEmitted() const
 void
 PythonStackTracker::LazilyEmittedFrame::updateInstructionOffset()
 {
-    if (d_frame) {
-        auto old_instruction_offset = d_instruction_offset;
-        d_instruction_offset = compat::frameGetLasti(d_frame);
+    auto old_instruction_offset = d_instruction_offset;
+    d_instruction_offset = compat::frameGetLasti(d_frame.get());
 
-        if (d_instruction_offset != old_instruction_offset) {
-            d_emitted = false;
-        }
+    if (d_instruction_offset != old_instruction_offset) {
+        d_emitted = false;
     }
 }
 
-void
-PythonStackTracker::LazilyEmittedFrame::freezeInstructionOffset()
+PyFrameObject*
+PythonStackTracker::LazilyEmittedFrame::releaseFrame()
 {
-    d_frame = nullptr;
-}
-
-bool
-PythonStackTracker::LazilyEmittedFrame::isFrozen() const
-{
-    return d_frame == nullptr;
-}
-
-void
-PythonStackTracker::LazilyEmittedFrame::resolveCodeObjectId(Tracker& tracker)
-{
-    if (d_code) {
-        d_code_object_id = tracker.registerCodeObject(d_code, d_code_info);
-        d_code = nullptr;
-    }
+    return d_frame.release();
 }
 
 bool
@@ -692,7 +796,9 @@ PythonStackTracker::LazilyEmittedFrame::emit(Tracker& tracker)
         return true;  // Already emitted.
     }
 
-    resolveCodeObjectId(tracker);
+    if (!d_code_object_id) {
+        d_code_object_id = tracker.registerCodeObject(d_code, d_code_info);
+    }
     bool ret = tracker.pushFrame(Frame{d_code_object_id, d_instruction_offset, d_is_entry_frame});
     if (ret) {
         d_emitted = true;
@@ -700,39 +806,15 @@ PythonStackTracker::LazilyEmittedFrame::emit(Tracker& tracker)
     return ret;
 }
 
-std::vector<PythonStackTracker::LazilyEmittedFrame>
-PythonStackTracker::pythonFrameToStack(PyFrameObject* current_frame, Tracker& tracker)
-{
-    std::vector<LazilyEmittedFrame> stack;
-    while (current_frame) {
-        try {
-            stack.push_back(LazilyEmittedFrame(current_frame));
-        } catch (const std::runtime_error&) {
-            return {};
-        }
-
-        stack.back().resolveCodeObjectId(tracker);
-        stack.back().updateInstructionOffset();
-        stack.back().freezeInstructionOffset();
-        current_frame = compat::frameGetBack(current_frame);
-    }
-
-    return stack;
-}
-
 void
-PythonStackTracker::recordAllStacks(Tracker& tracker)
+PythonStackTracker::recordAllStacks()
 {
     // We need to ensure that stacks are captured atomically with respect to
     // incrementing s_tracker_generation and to setting Tracker::isActive().
     // The caller must use the GIL for this in with-GIL builds, and call
     // _PyEval_StopTheWorld in free-threaded builds. Otherwise, the shadow
-    // stack may become inconsistent with the true stack for a thread, which
-    // leads to frames being used after they've been freed.
-
-    // Additionally, the Tracker mutex must be held, as pythonFrameToStack
-    // calls registerCodeObject. The Tracker is an argument as this function
-    // is called before tracking is activated and the singleton is installed.
+    // stack may become inconsistent with the true stack for a thread.
+    // Since the world is stopped, frames can't be released here.
 
     assert(PyGILState_Check());
     PyThreadState* current_thread = PyThreadState_Get();
@@ -754,8 +836,13 @@ PythonStackTracker::recordAllStacks(Tracker& tracker)
             continue;
         }
 
-        stack_by_thread[tstate] = pythonFrameToStack(frame, tracker);
-        if (PyErr_Occurred()) {
+        auto& stack = stack_by_thread[tstate];
+        try {
+            for (; frame; frame = compat::frameGetBack(frame)) {
+                stack.push_back(LazilyEmittedFrame(frame));
+            }
+        } catch (const std::runtime_error&) {
+            deferReleasingFrames(stack_by_thread);
             throw std::runtime_error("Failed to capture a thread's Python stack");
         }
     }
@@ -770,6 +857,9 @@ PythonStackTracker::recordAllStacks(Tracker& tracker)
         // previous generation number and immediately think they're out of date.
         s_tracker_generation++;
     }
+
+    // Stacks left over from the previous Tracker, if any.
+    deferReleasingFrames(stack_by_thread);
 
     PythonStackTracker::get().populateShadowStack();
 }
@@ -787,8 +877,21 @@ PythonStackTracker::removeProfileHooks()
 {
     assert(PyGILState_Check());
     compat::setprofileAllThreads(nullptr, nullptr);
-    std::unique_lock<std::mutex> lock(s_mutex);
-    s_initial_stack_by_thread.clear();
+    {
+        std::unique_lock<std::mutex> lock(s_mutex);
+        deferReleasingFrames(s_initial_stack_by_thread);
+    }
+
+    // Frames on any thread's stack will never be popped now. The Tracker is
+    // inactive, so other threads only touch their stacks while attached to
+    // the interpreter, which the GIL or stopping the world prevents.
+    // destroyTracker releases the frames.
+    StopTheWorldGuard stop_the_world;
+    RecursionGuard guard;
+    std::lock_guard<std::mutex> lock(s_frame_ownership->mutex);
+    for (auto* stack : s_frame_ownership->stacks) {
+        deferReleasingFramesLocked(*stack);
+    }
 }
 
 void
@@ -800,7 +903,7 @@ PythonStackTracker::clear()
 
     d_num_pending_pops +=
             std::count_if(d_stack->begin(), d_stack->end(), [](const auto& f) { return f.isEmitted(); });
-    d_stack->clear();
+    deferReleasingFrames(*d_stack);
 }
 
 Tracker::Tracker(
@@ -1065,6 +1168,8 @@ Tracker::parentFork()
 void
 Tracker::childFork()
 {
+    PythonStackTracker::resetAfterFork();
+
     // Intentionally leak any old tracker. Its destructor cannot be called,
     // because it would try to destroy mutexes that might be locked by threads
     // that no longer exist, and to join a background thread that no longer
@@ -1111,7 +1216,7 @@ Tracker::childFork()
 
     StopTheWorldGuard stop_the_world;
     std::unique_lock lock(*s_mutex);
-    PythonStackTracker::recordAllStacks(*s_instance_owner);
+    PythonStackTracker::recordAllStacks();
     tracking_api::Tracker::activate();
     RecursionGuard::setValue(false);
 }
@@ -1495,7 +1600,7 @@ Tracker::createTracker(
 
     StopTheWorldGuard stop_the_world;
     std::unique_lock lock(*s_mutex);
-    PythonStackTracker::recordAllStacks(*s_instance_owner);
+    PythonStackTracker::recordAllStacks();
     tracking_api::Tracker::activate();
     Py_RETURN_NONE;
 }
@@ -1505,6 +1610,7 @@ Tracker::destroyTracker()
 {
     // Note: the GIL is used for synchronization of the singleton
     s_instance_owner.reset();
+    PythonStackTracker::releaseDeferredFrames();
     Py_RETURN_NONE;
 }
 
@@ -1568,6 +1674,8 @@ PyTraceFunction(
 {
     RecursionGuard guard;
     if (!Tracker::isActive()) {
+        // Any stack will be discarded before being used again; free it now.
+        PythonStackTracker::discardStack();
         return 0;
     }
 
@@ -1578,6 +1686,7 @@ PyTraceFunction(
     }
 
     PythonStackTracker::get().handleTraceEvent(what, frame);
+    PythonStackTracker::releaseDeferredFrames();
     return 0;
 }
 
@@ -1591,8 +1700,7 @@ Tracker::beginTrackingGreenlets()
 void
 Tracker::handleGreenletSwitch(PyObject* from, PyObject* to)
 {
-    // We must stop tracking the stack once our trace function is uninstalled.
-    // Otherwise, we'd keep referencing frames after they're destroyed.
+    // Once our profile function is uninstalled, we stop tracking the stack.
     PyThreadState* ts = PyThreadState_Get();
     if (ts->c_profilefunc != PyTraceFunction) {
         return;
@@ -1613,6 +1721,7 @@ set_up_pthread_fork_handlers()
         // On macOS the recursion guard uses pthread TLS keys, so we
         // need to create those keys before we install our handlers.
         RecursionGuard::initialize();
+        PythonStackTracker::initialize();
         pthread_atfork(&Tracker::prepareFork, &Tracker::parentFork, NULL);
     });
 }

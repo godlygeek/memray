@@ -327,6 +327,61 @@ def test_valloc_at_thread_exit_in_subprocess(tmpdir, monkeypatch):
     assert len(vallocs) == 1
 
 
+@pytest.mark.parametrize("use_pthread_key", [False, True])
+def test_python_frames_pushed_from_tls_destructor(
+    tmpdir, monkeypatch, use_pthread_key
+):
+    """Test Python code run from a TLS destructor that runs after our own."""
+    # GIVEN
+    output = Path(tmpdir) / "test.bin"
+    extension_name = "multithreaded_extension"
+    extension_path = tmpdir / extension_name
+    shutil.copytree(TEST_MULTITHREADED_EXTENSION, extension_path)
+    subprocess.run(
+        [sys.executable, str(extension_path / "setup.py"), "build_ext", "--inplace"],
+        check=True,
+        cwd=extension_path,
+        capture_output=True,
+    )
+
+    code = dedent(
+        f"""
+        from memray import Tracker
+        from memray._test import MemoryAllocator
+        from testext import run_python_at_thread_exit
+
+        allocator = MemoryAllocator()
+
+        def allocating_function():
+            allocator.valloc(1234)
+            allocator.free()
+
+        def callback():
+            allocating_function()
+
+        with Tracker({str(output)!r}):
+            run_python_at_thread_exit(callback, {use_pthread_key})
+        """
+    )
+
+    # WHEN
+    with monkeypatch.context() as ctx:
+        ctx.setenv("PYTHONPATH", str(extension_path), prepend=":")
+        subprocess.run([sys.executable, "-c", code], check=True)
+
+    # THEN
+    vallocs = [
+        record
+        for record in FileReader(output).get_allocation_records()
+        if record.allocator == AllocatorType.VALLOC
+    ]
+    assert len(vallocs) == 2
+    for valloc in vallocs:
+        functions = [frame[0] for frame in valloc.stack_trace()]
+        assert "allocating_function" in functions
+        assert "callback" in functions
+
+
 @pytest.mark.parametrize("py_finalize", [True, False])
 def test_hard_exit(tmpdir, py_finalize):
     """Test a program that exits directly under the context manager"""

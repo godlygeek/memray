@@ -1,3 +1,4 @@
+import sys
 import threading
 from pathlib import Path
 
@@ -144,3 +145,89 @@ def test_setting_python_thread_name(tmpdir):
         if rec.allocator == AllocatorType.VALLOC
     ]
     assert names == expected_names
+
+
+def test_line_numbers_in_preexisting_thread_before_any_profile_event(tmpdir):
+    """Allocations in a thread that existed before tracking started get the
+    right line numbers, even before our profile function sees any event."""
+    # GIVEN
+    output = Path(tmpdir) / "test.bin"
+    started = threading.Event()
+    go = []
+
+    def allocating_function():
+        started.set()
+        while not go:  # Spin without making calls, so no profile events fire
+            pass
+        [None] * 1_000_001  # first allocation
+        [None] * 1_000_002  # second allocation
+
+    t = threading.Thread(target=allocating_function)
+    t.start()
+    assert started.wait(timeout=10)
+
+    # WHEN
+    with Tracker(output):
+        go.append(True)
+        t.join()
+
+    # THEN
+    records = sorted(
+        (
+            record
+            for record in FileReader(output).get_allocation_records()
+            if record.size >= 8_000_000
+        ),
+        key=lambda record: record.size,
+    )
+    source = Path(__file__).read_text().splitlines()
+    lines = [source[record.stack_trace()[0][2] - 1] for record in records]
+    assert len(lines) == 2
+    assert "# first allocation" in lines[0]
+    assert "# second allocation" in lines[1]
+
+
+def test_preexisting_thread_inside_trace_function_when_tracking_starts(tmpdir):
+    """A thread's captured stack can include sys.settrace trace function frames
+    that our profile function never sees get popped. Make sure they're dropped."""
+    # GIVEN
+    output = Path(tmpdir) / "test.bin"
+    allocator = MemoryAllocator()
+    started = threading.Event()
+    go = []
+
+    def tracer(frame, event, arg):
+        if event == "call" and frame.f_code is traced_function.__code__:
+            started.set()
+            while not go:
+                pass
+        return None
+
+    def traced_function():
+        allocator.valloc(1234)
+        allocator.free()
+
+    def thread_body():
+        sys.settrace(tracer)
+        traced_function()
+        sys.settrace(None)
+
+    t = threading.Thread(target=thread_body)
+    t.start()
+    assert started.wait(timeout=10)
+
+    # WHEN
+    with Tracker(output):
+        go.append(True)
+        t.join()
+
+    # THEN
+    (valloc,) = [
+        record
+        for record in FileReader(output).get_allocation_records()
+        if record.allocator == AllocatorType.VALLOC
+    ]
+    functions = [frame[0] for frame in valloc.stack_trace()]
+    assert "tracer" not in functions
+    caller = functions[functions.index("traced_function") + 1]
+    assert caller == "thread_body"
